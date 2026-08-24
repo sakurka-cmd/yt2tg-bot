@@ -18,9 +18,9 @@ logging.basicConfig(
 logger = logging.getLogger("yt2tg")
 
 # AsyncTeleBot uses aiohttp which doesn't respect HTTPS_PROXY env var.
-# Pass proxy explicitly so Telegram API goes through gost bridge.
-_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-bot = AsyncTeleBot(TG_BOT_TOKEN, proxy=_proxy)
+# Enable trust_env so aiohttp picks up HTTPS_PROXY from environment.
+bot = AsyncTeleBot(TG_BOT_TOKEN)
+bot.session.trust_env = True  # aiohttp: respect HTTPS_PROXY env
 register_handlers(bot)
 
 
