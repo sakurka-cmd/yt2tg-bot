@@ -18,9 +18,16 @@ logging.basicConfig(
 logger = logging.getLogger("yt2tg")
 
 # AsyncTeleBot uses aiohttp which doesn't respect HTTPS_PROXY env var.
-# Enable trust_env so aiohttp picks up HTTPS_PROXY from environment.
+# Monkey-patch aiohttp to respect HTTPS_PROXY env var
+# (AsyncTeleBot creates its own session without trust_env=True)
+import aiohttp
+_orig_session_init = aiohttp.ClientSession.__init__
+def _patched_init(self, *args, **kwargs):
+    kwargs.setdefault("trust_env", True)
+    _orig_session_init(self, *args, **kwargs)
+aiohttp.ClientSession.__init__ = _patched_init
+
 bot = AsyncTeleBot(TG_BOT_TOKEN)
-bot.session.trust_env = True  # aiohttp: respect HTTPS_PROXY env
 register_handlers(bot)
 
 
