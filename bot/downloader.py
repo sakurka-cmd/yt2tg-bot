@@ -26,6 +26,9 @@ YOUTUBE_PLAYLIST_RE = re.compile(
 )
 
 YTDLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
+# Run yt-dlp with lowest CPU priority so asyncio event loop gets CPU
+import os as _os
+_YTDLP_NICE = ["nice", "-n", "19"]
 
 # Global status for /status command
 current_status: dict = {
@@ -56,7 +59,7 @@ async def get_video_info(url: str) -> dict | None:
     cmd = [YTDLP_BIN, "--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0:
@@ -137,7 +140,7 @@ async def get_channel_info(url: str) -> dict | None:
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode == 0:
@@ -271,6 +274,7 @@ async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None
         # so they don't leak into current_status["error"] on successful downloads.
         # Real errors still set non-zero returncode and get reported separately.
         "--no-warnings",
+        "--concurrent-fragments", "1",
         # Impersonate Chrome at the TLS layer (curl_cffi backend). YouTube
         # returns HTTP 429 to plain requests on some videos — impersonation
         # makes the requests look like a real browser and largely avoids
@@ -292,7 +296,7 @@ async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         while True:
             line = await proc.stdout.readline()
@@ -503,7 +507,7 @@ async def download_subtitles(url: str, yt_id: str) -> str | None:
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(proc.wait(), timeout=120)
     except asyncio.TimeoutError:
@@ -598,7 +602,7 @@ async def _list_channel_videos_flat(channel_url: str, max_count: int = 200) -> l
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
         if proc.returncode != 0:
@@ -722,7 +726,7 @@ async def search_youtube(query: str, max_results: int = 20) -> list[dict]:
     ]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0:
