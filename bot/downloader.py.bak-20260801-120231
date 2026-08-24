@@ -1,0 +1,552 @@
+"""yt-dlp wrapper for downloading YouTube videos."""
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+from pathlib import Path
+
+from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR
+
+logger = logging.getLogger(__name__)
+
+YOUTUBE_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?"
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)"
+    r"([a-zA-Z0-9_-]{11})"
+)
+
+CHANNEL_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?youtube\.com/(?:channel/|@|c/)([a-zA-Z0-9_.-]+)"
+)
+
+YOUTUBE_PLAYLIST_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)"
+)
+
+YTDLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
+
+# Global status for /status command
+current_status: dict = {
+    "task": "",
+    "url": "",
+    "title": "",
+    "progress": "",
+    "error": "",
+}
+
+
+def extract_video_id(url: str) -> str | None:
+    m = YOUTUBE_URL_RE.search(url)
+    return m.group(1) if m else None
+
+
+def extract_channel_id(url: str) -> str | None:
+    m = CHANNEL_URL_RE.search(url)
+    return m.group(1) if m else None
+
+
+def get_format_string(quality: str) -> str:
+    fmt = QUALITIES.get(quality, QUALITIES[DEFAULT_QUALITY])
+    return fmt
+
+
+async def get_video_info(url: str) -> dict | None:
+    cmd = [YTDLP_BIN, "--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            logger.error("yt-dlp info failed: %s", stderr.decode(errors="replace")[:500])
+            return None
+        import json
+        info = json.loads(stdout.decode())
+        return {
+            "id": info.get("id", ""),
+            "title": info.get("title", ""),
+            "duration": info.get("duration", 0),
+            # channel = display name (e.g. "Асафьев. Жизнь" or "Russian Car Crash channel")
+            "channel": info.get("channel", ""),
+            # uploader_id = full handle with @ (e.g. "@russiancrashchannel6171")
+            # This is the canonical handle on YouTube — use this (without @) for
+            # playlist naming so /dl and /subscribe produce the same name.
+            "uploader_id": info.get("uploader_id", ""),
+            # uploader = display name (NOT handle) for many YouTube videos — kept for backward compat only
+            "uploader": info.get("uploader", "") or info.get("channel", ""),
+            "uploader_url": info.get("uploader_url", "") or info.get("channel_url", ""),
+            # channel_id = UCxxxxxxx (unique YouTube channel ID, never changes)
+            # This is the reliable key for matching /dl → subscription
+            "channel_id": info.get("channel_id", ""),
+            "description": info.get("description", "")[:500],
+            "thumbnail": info.get("thumbnail", ""),
+            "filesize_approx": info.get("filesize_approx", 0),
+            # yt-dlp returns upload_date as YYYYMMDD string
+            "upload_date": info.get("upload_date", ""),
+        }
+    except asyncio.TimeoutError:
+        logger.error("yt-dlp info timeout for %s", url)
+        return None
+    except Exception as e:
+        logger.error("yt-dlp info error: %s", e)
+        return None
+
+
+def clean_handle(s: str) -> str:
+    """Extract a clean handle (without @, without URL prefix) from various
+    yt-dlp fields: uploader_id (@russiancrashchannel6171) or uploader_url
+    (https://www.youtube.com/@russiancrashchannel6171).
+
+    Returns the bare handle, e.g. 'russiancrashchannel6171'.
+    Returns empty string if input is empty.
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    if s.startswith("@"):
+        return s[1:]
+    if s.startswith("http"):
+        from urllib.parse import urlparse
+        path = urlparse(s).path.strip("/")
+        if path.startswith("@"):
+            return path[1:].split("/")[0]
+    return s
+
+
+async def get_channel_info(url: str) -> dict | None:
+    """Get channel info via yt-dlp (preferred) or RSS feed (fallback).
+
+    Returns: {
+        "id": <channel_id UCxxxxx or handle>,
+        "channel_id": <UCxxxxx>,           # unique YouTube channel ID
+        "channel_handle": <handle without @>,  # e.g. "russiancrashchannel6171"
+        "title": <display name>,            # e.g. "Russian Car Crash channel"
+        "link": <channel URL>,
+    }
+    """
+    # Try yt-dlp first — it returns the canonical channel_id (UCxxxxx)
+    # and uploader_id (the actual handle YouTube uses, which may differ
+    # from the handle in the URL the user pasted).
+    cmd = [
+        YTDLP_BIN, "--dump-json", "--no-download",
+        "--playlist-items", "1",  # only fetch first video to save time
+        "--no-warnings",
+        url,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode == 0:
+            import json
+            info = json.loads(stdout.decode())
+            channel_id = info.get("channel_id", "")
+            uploader_id = info.get("uploader_id", "")
+            handle = clean_handle(uploader_id) or clean_handle(info.get("uploader_url", ""))
+            display_name = info.get("channel", "") or handle or channel_id
+            return {
+                "id": channel_id or handle or extract_channel_id(url) or "",
+                "channel_id": channel_id,
+                "channel_handle": handle,
+                "title": display_name,
+                "link": info.get("uploader_url", url),
+            }
+        else:
+            logger.warning("yt-dlp channel info failed, falling back to RSS: %s",
+                          stderr.decode(errors="replace")[:300])
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp channel info timeout, falling back to RSS")
+    except Exception as e:
+        logger.warning("yt-dlp channel info error, falling back to RSS: %s", e)
+
+    # Fallback to RSS (used when yt-dlp can't resolve the channel)
+    return await _get_channel_info_rss(url)
+
+
+async def _get_channel_info_rss(url: str) -> dict | None:
+    """Fallback: get channel info via RSS feed (less accurate, no UCxxxxx)."""
+    channel_id = extract_channel_id(url)
+    if not channel_id:
+        return None
+    import feedparser
+    if channel_id.startswith("@") or channel_id.startswith("UC"):
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    else:
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id=@{channel_id}"
+    try:
+        feed = feedparser.parse(feed_url)
+        if not feed.entries:
+            feed_url = f"https://www.youtube.com/feeds/videos.xml?search_query={channel_id}"
+            feed = feedparser.parse(feed_url)
+        if feed.feed:
+            return {
+                "id": channel_id,
+                "channel_id": "",  # RSS doesn't reliably give UCxxxxx
+                "channel_handle": clean_handle(channel_id) or channel_id,
+                "title": feed.feed.get("title", channel_id),
+                "link": feed.feed.get("link", url),
+            }
+    except Exception as e:
+        logger.error("Channel info RSS error: %s", e)
+    return None
+
+
+async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None:
+    """Download video, return path. Caller must delete. Returns 'TOO_LARGE' if too big.
+
+    Also downloads auto-generated Russian subtitles (if available) as a sidecar
+    .vtt file in TMP_DIR. The caller can locate them via find_subtitle_path(yt_id).
+    """
+    global current_status
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+    fmt = get_format_string(quality)
+    output_template = os.path.join(TMP_DIR, "%(id)s.%(ext)s")
+
+    cmd = [
+        YTDLP_BIN, "-f", fmt, "--merge-output-format", "mp4",
+        "-o", output_template, "--no-playlist", "--no-cache-dir",
+        "--newline", "--progress",
+        # Suppress non-fatal warnings (Python 3.10 deprecation notice, etc.)
+        # so they don't leak into current_status["error"] on successful downloads.
+        # Real errors still set non-zero returncode and get reported separately.
+        "--no-warnings",
+        # Subtitles: download auto-generated Russian subs as VTT.
+        # Only Russian (not English) — YouTube returns HTTP 429 on en subs
+        # for some videos, and yt-dlp exits with non-zero even though the
+        # video itself downloaded fine.
+        "--write-auto-sub", "--sub-lang", "ru",
+        "--sub-format", "vtt", "--convert-subs", "vtt",
+        url,
+    ]
+    if MAX_FILE_SIZE > 0:
+        cmd.extend(["--max-filesize", str(MAX_FILE_SIZE)])
+
+    yt_id = extract_video_id(url) or "unknown"
+    current_status.update({"task": "download", "url": url, "title": yt_id, "progress": "0%", "error": ""})
+    logger.info("Downloading: %s (quality: %s)", url, quality)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            # Parse progress: [download]  45.2% of ~150.00MiB
+            if "[download]" in text and "%" in text:
+                pct = text.split("%")[0].split()[-1] if "%" in text else ""
+                current_status["progress"] = pct
+
+        await asyncio.wait_for(proc.wait(), timeout=600)
+
+        # Check if the video file made it to disk despite a non-zero exit.
+        # yt-dlp exits with code 1 when subtitle download fails (e.g. YouTube
+        # returns HTTP 429 for some subtitle languages) even though the video
+        # itself downloaded successfully. We treat the download as successful
+        # if the video file exists and is non-trivial in size.
+        video_path: str | None = None
+        for ext in ("mp4", "mkv", "webm", "flv"):
+            path = os.path.join(TMP_DIR, f"{yt_id}.{ext}")
+            if os.path.exists(path) and os.path.getsize(path) > 1024:
+                video_path = path
+                break
+        if not video_path:
+            # Fallback: find any recent file in TMP_DIR matching this yt_id
+            files = sorted(Path(TMP_DIR).glob(f"{yt_id}*"))
+            for f in files:
+                if f.stat().st_size > 1024 and f.suffix.lower() in (".mp4", ".mkv", ".webm", ".flv"):
+                    video_path = str(f)
+                    break
+
+        if proc.returncode != 0:
+            err = (await proc.stderr.read()).decode(errors="replace")
+            if video_path:
+                # Video downloaded successfully, but something non-fatal failed
+                # (usually subtitles). Log the warning and return the video path —
+                # subtitles are optional and shouldn't block the main download.
+                logger.warning("yt-dlp returned non-zero but video file exists, treating as success: %s", err[:300])
+                return video_path
+            logger.error("yt-dlp download failed: %s", err[:500])
+            current_status["error"] = err[:200]
+            if "File is larger than max-filesize" in err:
+                return "TOO_LARGE"
+            return None
+
+        if not video_path:
+            logger.error("Downloaded file not found for %s (returncode=0)", yt_id)
+            return None
+        return video_path
+    except asyncio.TimeoutError:
+        logger.error("yt-dlp download timeout for %s", url)
+        current_status["error"] = "Timeout"
+        return None
+    except Exception as e:
+        logger.error("yt-dlp download error: %s", e)
+        current_status["error"] = str(e)
+        return None
+
+
+def find_subtitle_path(yt_id: str) -> str | None:
+    """Find the VTT subtitle sidecar file downloaded by yt-dlp for this video.
+
+    yt-dlp writes subtitles as `<yt_id>.<lang>.vtt` (e.g. `dQw4w9WgXcQ.ru.vtt`).
+    Returns the path to the Russian subtitle if available, else the first .vtt
+    file matching this yt_id. Returns None if no subtitle was downloaded.
+    """
+    if not yt_id:
+        return None
+    candidates = sorted(Path(TMP_DIR).glob(f"{yt_id}.ru.vtt"))
+    if candidates:
+        return str(candidates[0])
+    candidates = sorted(Path(TMP_DIR).glob(f"{yt_id}.*.vtt"))
+    if candidates:
+        return str(candidates[0])
+    return None
+
+
+async def list_channel_videos(channel_url: str, max_count: int = 200) -> list[dict]:
+    """Fetch list of videos on a YouTube channel/playlist.
+
+    Tries RSS first (for channels with UC ID), then falls back to yt-dlp --flat-playlist.
+    """
+    # Try RSS for channel URLs with UC ID
+    from urllib.parse import urlparse
+    parsed = urlparse(channel_url)
+    path_parts = [p for p in parsed.path.split("/") if p]
+    channel_id = ""
+    if "channel" in path_parts:
+        idx = path_parts.index("channel")
+        if idx + 1 < len(path_parts):
+            channel_id = path_parts[idx + 1]
+    if channel_id and channel_id.startswith("UC"):
+        rss_videos = await _list_channel_videos_rss(channel_id)
+        if rss_videos:
+            if max_count > len(rss_videos):
+                flat_videos = await _list_channel_videos_flat(channel_url, max_count)
+                rss_ids = {v["id"] for v in rss_videos}
+                for v in flat_videos:
+                    if v["id"] not in rss_ids:
+                        rss_videos.append(v)
+                        rss_ids.add(v["id"])
+            return rss_videos[:max_count]
+    # Fallback: flat-playlist only
+    return await _list_channel_videos_flat(channel_url, max_count)
+
+
+async def _list_channel_videos_rss(channel_id: str) -> list[dict]:
+    """Fetch videos via YouTube RSS feed (up to 15 most recent WITH dates)."""
+    import feedparser
+    if not channel_id.startswith("UC"):
+        return []
+    feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    try:
+        feed = feedparser.parse(feed_url)
+        if not feed.entries:
+            return []
+        results = []
+        for entry in feed.entries:
+            yt_url = entry.get("link", "")
+            yt_id = extract_video_id(yt_url)
+            if not yt_id:
+                continue
+            published = entry.get("published", "")
+            upload_date = ""
+            if published:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                    upload_date = dt.strftime("%Y%m%d")
+                except Exception:
+                    pass
+            results.append({
+                "id": yt_id,
+                "title": entry.get("title", "Untitled"),
+                "upload_date": upload_date,
+                "url": yt_url or f"https://www.youtube.com/watch?v={yt_id}",
+            })
+        return results
+    except Exception as e:
+        logger.warning("RSS fetch failed for %s: %s", channel_id, e)
+        return []
+
+
+async def _list_channel_videos_flat(channel_url: str, max_count: int = 200) -> list[dict]:
+    """Fetch videos via yt-dlp --flat-playlist."""
+    import json as _json
+    cmd = [
+        YTDLP_BIN, "--flat-playlist", "--dump-json",
+        "--playlist-items", f"1-{max_count}",
+        "--no-warnings",
+        channel_url,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")[:500]
+            logger.error("yt-dlp flat-playlist failed for %s: %s", channel_url, err)
+            return []
+        results = []
+        for line in stdout.decode().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = _json.loads(line)
+            except Exception:
+                continue
+            vid = item.get("id", "")
+            if not vid:
+                continue
+            results.append({
+                "id": vid,
+                "title": item.get("title", "Untitled"),
+                "upload_date": item.get("upload_date") or "",
+                "url": item.get("url") or f"https://www.youtube.com/watch?v={vid}",
+            })
+        logger.info("flat-playlist returned %d videos for %s", len(results), channel_url)
+        return results
+    except asyncio.TimeoutError:
+        logger.error("yt-dlp flat-playlist timeout for %s", channel_url)
+        return []
+    except Exception as e:
+        logger.error("yt-dlp flat-playlist error: %s", e)
+        return []
+
+
+def cleanup_file(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+            logger.info("Cleaned up: %s", path)
+    except OSError as e:
+        logger.warning("Cleanup failed for %s: %s", path, e)
+
+def extract_playlist_id(url: str) -> str | None:
+    m = YOUTUBE_PLAYLIST_RE.search(url)
+    return m.group(1) if m else None
+
+
+async def get_youtube_playlist_info(playlist_url: str) -> dict | None:
+    """Get YouTube playlist title + list of videos using yt-dlp --flat-playlist.
+
+    Returns: {"title": "...", "videos": [{"id":..., "title":..., "upload_date":"YYYYMMDD", "url":...}, ...]}
+    or None on failure.
+    """
+    import json as _json
+    # First get the playlist title via --dump-json (first item has playlist metadata)
+    cmd_title = [
+        YTDLP_BIN, "--flat-playlist", "--dump-json",
+        "--playlist-items", "0",
+        "--no-warnings",
+        playlist_url,
+    ]
+    playlist_title = "YouTube Playlist"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_title, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        for line in stdout.decode().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = _json.loads(line)
+                # Playlist title is in the "playlist" field or we get it from --print
+                if "playlist" in item:
+                    playlist_title = item["playlist"]
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Get all video entries
+    videos = await list_channel_videos(playlist_url, max_count=200)
+    if not videos:
+        # list_channel_videos tries RSS first which won't work for playlists.
+        # Use flat-playlist directly.
+        videos = await _list_channel_videos_flat(playlist_url, max_count=200)
+
+    return {
+        "title": playlist_title,
+        "videos": videos or [],
+    }
+
+
+async def search_youtube(query: str, max_results: int = 20) -> list[dict]:
+    """Search YouTube via yt-dlp and return top results with metadata + thumbnail URL.
+
+    Uses yt-dlp's 'ytsearchN:' pseudo-URL: yt-dlp "ytsearch20:query" --flat-playlist
+    returns N videos with id, title, duration, upload_date, channel, view_count.
+
+    Returns: list of dicts, each:
+      {
+        "id": "<11-char YouTube video ID>",
+        "title": "...",
+        "url": "https://www.youtube.com/watch?v=...",
+        "duration": 123,        # seconds (0 if unknown)
+        "upload_date": "YYYYMMDD",
+        "channel": "Channel Name",
+        "view_count": 12345,
+        "thumbnail": "https://i.ytimg.com/vi/<id>/mqdefault.jpg",
+      }
+    """
+    import json as _json
+    # ytsearchN: returns flat-playlist of search results
+    # --flat-playlist avoids downloading each video (fast)
+    cmd = [
+        YTDLP_BIN, "--flat-playlist", "--dump-json",
+        "--no-warnings", "--no-playlist",
+        f"ytsearch{max_results}:{query}",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace")[:500]
+            logger.error("yt-dlp search failed for %r: %s", query, err)
+            return []
+        results = []
+        for line in stdout.decode().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = _json.loads(line)
+            except Exception:
+                continue
+            vid = item.get("id", "")
+            if not vid or len(vid) != 11:
+                continue
+            # duration in flat-playlist may be missing or 0 — best-effort
+            duration = item.get("duration") or 0
+            results.append({
+                "id": vid,
+                "title": item.get("title", "Untitled"),
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "duration": duration,
+                "upload_date": item.get("upload_date", ""),
+                "channel": item.get("channel") or item.get("uploader") or "",
+                "view_count": item.get("view_count") or 0,
+                "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            })
+        logger.info("yt-dlp search for %r returned %d results", query, len(results))
+        return results
+    except asyncio.TimeoutError:
+        logger.error("yt-dlp search timeout for %r", query)
+        return []
+    except Exception as e:
+        logger.error("yt-dlp search error: %s", e)
+        return []

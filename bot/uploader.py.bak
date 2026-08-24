@@ -1,0 +1,328 @@
+"""VideoHost API uploader."""
+
+import logging
+import os
+
+import aiohttp
+
+from bot.config import VIDEOHOST_URL, VIDEOHOST_TOKEN
+from bot.downloader import current_status
+
+logger = logging.getLogger(__name__)
+
+
+def _headers() -> dict:
+    h = {}
+    if VIDEOHOST_TOKEN:
+        h["Authorization"] = f"Bearer {VIDEOHOST_TOKEN}"
+        h["X-Bot-Token"] = VIDEOHOST_TOKEN
+    return h
+
+
+async def _request(method: str, path: str, **kwargs) -> dict | None:
+    url = f"{VIDEOHOST_URL}{path}"
+    kwargs.setdefault("headers", _headers())
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.request(method, url, **kwargs) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    logger.error("VideoHost %s %s → %d: %s", method, path, resp.status, data)
+                    return None
+                return data
+    except Exception as e:
+        logger.error("VideoHost request error %s %s: %s", method, path, e)
+        return None
+
+
+async def download_thumbnail(url: str, tmp_dir: str = "/tmp/yt2tg") -> str | None:
+    """Download thumbnail image from URL to a temp file.
+    Returns path to the downloaded file, or None on failure.
+    The bot VPS has access to YouTube, so this works even when VH VPS can't reach YouTube.
+    """
+    import aiohttp
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    logger.warning("Thumbnail download failed %d: %s", resp.status, url)
+                    return None
+                data = await resp.read()
+                if not data:
+                    return None
+                # Determine extension from URL or content-type
+                ct = resp.headers.get("content-type", "")
+                if "png" in ct:
+                    ext = ".png"
+                elif "webp" in ct:
+                    ext = ".webp"
+                else:
+                    ext = ".jpg"
+                path = os.path.join(tmp_dir, f"thumb_{hash(url) & 0xFFFFFFFF}{ext}")
+                with open(path, "wb") as f:
+                    f.write(data)
+                logger.info("Downloaded thumbnail: %s → %s (%d bytes)", url[:60], path, len(data))
+                return path
+    except Exception as e:
+        logger.warning("Thumbnail download error: %s", e)
+        return None
+
+
+async def upload_video(file_path: str, title: str,
+                       playlist_id: str | None = None,
+                       published_at: str = "",
+                       thumbnail_url: str = "",
+                       youtube_id: str = "") -> dict | None:
+    """Upload video to VideoHost. Returns response dict or None.
+
+    published_at: optional ISO date string or YYYYMMDD (yt-dlp upload_date).
+    thumbnail_url: YouTube preview URL — will be DOWNLOADED by the bot
+    (which has YouTube access) and uploaded as a file to VideoHost.
+    youtube_id: optional 11-char YouTube video ID.
+    """
+    global current_status
+    file_size = os.path.getsize(file_path)
+    size_mb = file_size / (1024 * 1024)
+
+    # Download thumbnail to temp file (bot VPS has YouTube access)
+    thumb_path = None
+    if thumbnail_url:
+        thumb_path = await download_thumbnail(thumbnail_url)
+    if not thumb_path and youtube_id:
+        # Fallback: construct URL from youtube_id
+        fallback_url = f"https://img.youtube.com/vi/{youtube_id}/hqdefault.jpg"
+        thumb_path = await download_thumbnail(fallback_url)
+
+    current_status.update({
+        "task": "upload", "title": title,
+        "progress": f"{size_mb:.1f} MB uploading...", "error": "",
+    })
+    logger.info("Uploading to VideoHost: %s (%.1f MB) playlist=%s published_at=%s yt_id=%s thumb=%s",
+                title, size_mb, playlist_id, published_at or "-", youtube_id or "-",
+                "yes" if thumb_path else "no")
+
+    try:
+        # Read thumbnail as base64 (small, ~100KB) for header transmission
+        thumb_b64 = ""
+        if thumb_path:
+            import base64
+            with open(thumb_path, "rb") as tf:
+                thumb_b64 = base64.b64encode(tf.read()).decode("ascii")
+
+        # Send video as raw body stream (NOT formData) — zero memory on server side.
+        # Metadata goes in headers, file content goes as request body.
+        upload_headers = _headers()
+        upload_headers["Content-Type"] = "application/octet-stream"
+        upload_headers["x-title"] = title
+        upload_headers["x-filename"] = os.path.basename(file_path)
+        if playlist_id:
+            upload_headers["x-playlist-id"] = playlist_id
+        if published_at:
+            upload_headers["x-published-at"] = published_at
+        if youtube_id:
+            upload_headers["x-youtube-id"] = youtube_id
+        if thumb_b64:
+            upload_headers["x-thumbnail-file"] = thumb_b64
+        elif thumbnail_url:
+            upload_headers["x-thumbnail-url"] = thumbnail_url
+
+        with open(file_path, "rb") as f:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{VIDEOHOST_URL}/api/bot/upload",
+                    data=f,  # raw file stream — aiohttp streams this without buffering
+                    headers=upload_headers,
+                    timeout=aiohttp.ClientTimeout(total=1800),
+                ) as resp:
+                    if resp.status == 201:
+                        data = await resp.json(content_type=None)
+                        vid_id = data.get("id") or data.get("video", {}).get("id", "?")
+                        logger.info("Uploaded: %s → %s", title, vid_id)
+                        data["id"] = vid_id
+                        current_status["progress"] = "done"
+                        return data
+                    else:
+                        err = await resp.text()
+                        logger.error("Upload failed %d: %s", resp.status, err[:300])
+                        current_status["error"] = f"HTTP {resp.status}"
+                        return None
+    except Exception as e:
+        logger.error("Upload error: %s", e)
+        current_status["error"] = str(e)
+        return None
+
+
+async def video_exists(videohost_id: str) -> bool:
+    """Check whether a previously uploaded video still exists on VideoHost.
+
+    Used by the bot to detect when a video has been deleted on VideoHost
+    (e.g. by an admin via the UI) so it can be re-uploaded instead of
+    silently skipped due to the local processed_videos cache.
+    """
+    if not videohost_id:
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{VIDEOHOST_URL}/api/bot/videos/{videohost_id}",
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status == 404:
+                    return False
+                # Auth or other error — be conservative, assume exists
+                # so we don't accidentally re-upload
+                logger.warning("video_exists check returned %d for %s — assuming exists",
+                               resp.status, videohost_id)
+                return True
+    except Exception as e:
+        logger.warning("video_exists check failed for %s: %s — assuming exists",
+                       videohost_id, e)
+        return True
+
+
+async def sort_playlist(playlist_id: str) -> bool:
+    """Ask VideoHost to reorder playlist items chronologically by publishedAt.
+
+    Returns True on success, False otherwise.
+    """
+    if not playlist_id:
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VIDEOHOST_URL}/api/bot/playlists/{playlist_id}/sort",
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    logger.info("Sorted playlist %s: %s items reordered",
+                                playlist_id, data.get("reordered", "?"))
+                    return True
+                else:
+                    err = await resp.text()
+                    logger.error("Sort playlist %s failed %d: %s",
+                                 playlist_id, resp.status, err[:300])
+                    return False
+    except Exception as e:
+        logger.error("Sort playlist error: %s", e)
+        return False
+
+
+async def list_playlists() -> list[dict]:
+    data = await _request("GET", "/api/bot/playlists")
+    if data and isinstance(data, list):
+        return data
+    return []
+
+
+async def list_playlist_items(playlist_id: str) -> list[dict]:
+    data = await _request("GET", f"/api/bot/playlists?playlistId={playlist_id}")
+    if data and isinstance(data, list):
+        return data
+    return []
+
+
+async def find_or_create_playlist(name: str, description: str = "") -> dict | None:
+    """Find an existing playlist by name, or create a new one via bot API.
+
+    Returns: {"id": "...", "name": "...", "description": "...", "createdAt": "..."}
+    or None on failure.
+    """
+    if not name or not name.strip():
+        return None
+    payload = {"name": name.strip()}
+    if description and description.strip():
+        payload["description"] = description.strip()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{VIDEOHOST_URL}/api/bot/playlists",
+                json=payload,
+                headers=_headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status in (200, 201):
+                    data = await resp.json(content_type=None)
+                    logger.info("find_or_create_playlist('%s') -> %s (status=%d)",
+                                name, data.get("id") if data else "?", resp.status)
+                    return data
+                else:
+                    err = await resp.text()
+                    logger.error("find_or_create_playlist failed %d: %s",
+                                 resp.status, err[:300])
+                    return None
+    except Exception as e:
+        logger.error("find_or_create_playlist error: %s", e)
+        return None
+
+
+async def reorder_playlist(playlist_id: str, items: list[dict]) -> bool:
+    """items: [{itemId, order}, ...]"""
+    # This endpoint requires auth session, not bot token.
+    # For bot, we skip reorder via API. If needed, implement differently.
+    return True
+
+
+async def get_playlist(playlist_id: str) -> dict | None:
+    """Get playlist details (including lifetimeDays) via bot token API.
+
+    Args:
+        playlist_id: VideoHost playlist ID
+
+    Returns: {"id": "...", "name": "...", "lifetimeDays": ..., ...} or None on failure.
+    Used by /manage ⏱ Время жизни to display the current value before editing.
+    """
+    if not playlist_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{VIDEOHOST_URL}/api/bot/playlists/{playlist_id}",
+                headers=_headers(),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    err = await resp.text()
+                    logger.error("get_playlist failed %d: %s", resp.status, err[:300])
+                    return None
+    except Exception as e:
+        logger.error("get_playlist error: %s", e)
+        return None
+
+
+async def update_playlist_lifetime(playlist_id: str, lifetime_days: int | None) -> dict | None:
+    """Set the watched-video lifetime (in days) for a playlist via bot token API.
+
+    Args:
+        playlist_id: VideoHost playlist ID
+        lifetime_days: Number of days after which watched videos are auto-deleted.
+                       None or 0 = disable lifetime (videos never auto-deleted).
+
+    Returns: {"id": "...", "name": "...", "lifetimeDays": ...} or None on failure.
+    """
+    if not playlist_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                f"{VIDEOHOST_URL}/api/bot/playlists/{playlist_id}",
+                json={"lifetimeDays": lifetime_days if lifetime_days and lifetime_days > 0 else None},
+                headers=_headers(),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info("Updated playlist %s lifetimeDays=%s", playlist_id, lifetime_days)
+                    return data
+                else:
+                    err = await resp.text()
+                    logger.error("update_playlist_lifetime failed %d: %s", resp.status, err[:300])
+                    return None
+    except Exception as e:
+        logger.error("update_playlist_lifetime error: %s", e)
+        return None
