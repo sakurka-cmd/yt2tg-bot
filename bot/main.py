@@ -53,15 +53,21 @@ async def main():
         BotCommand("versions", "📋 Версии"),
     ])
 
-    # Start scheduler in background
+    # Start polling FIRST — this is the main event loop driver.
+    # Scheduler and version_checker run as background tasks.
+    # Polling must be responsive even when scheduler is downloading videos.
     admin_id = ADMIN_IDS[0] if ADMIN_IDS else 0
+
+    # Start scheduler in background (will yield CPU to polling via asyncio)
     asyncio.create_task(scheduler_loop(bot, admin_id))
 
-    # Start version checker in background (notifies admins of new commits/APK)
+    # Start version checker in background
     asyncio.create_task(version_checker_loop(bot))
 
-    # Start polling
-    await bot.infinity_polling()
+    # Start polling — this blocks (runs forever), but asyncio ensures
+    # scheduler tasks get CPU time between polling cycles.
+    # Added timeout=10 (short long-poll cycle) for faster response.
+    await bot.infinity_polling(timeout=10, skip_pending=False)
 
 
 if __name__ == "__main__":
