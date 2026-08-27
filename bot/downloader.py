@@ -25,9 +25,27 @@ YOUTUBE_PLAYLIST_RE = re.compile(
     r"(?:https?://)?(?:www\.)?youtube\.com/.*[?&]list=([a-zA-Z0-9_-]+)"
 )
 
-YTDLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
+# ── yt-dlp binary resolution ────────────────────────────────────────────
+# The bot runs from a venv (/opt/yt2tg-bot/venv) that has curl_cffi installed
+# (required for --impersonate chrome). The system /usr/local/bin/yt-dlp does
+# NOT have curl_cffi, so calling it with --impersonate chrome crashes with:
+#   yt_dlp.utils.YoutubeDLError: Impersonate target "chrome" is not available.
+# Resolution order:
+#   1. YTDLP_BIN env variable (explicit override)
+#   2. yt-dlp in the same venv as the running Python (sys.executable dir)
+#   3. shutil.which("yt-dlp")  — system lookup (last resort, may lack curl_cffi)
+#   4. bare "yt-dlp"            — final fallback (relies on PATH)
+import sys as _sys
+_VENV_BIN_DIR = os.path.dirname(_sys.executable)
+_VENV_YTDLP = os.path.join(_VENV_BIN_DIR, "yt-dlp")
+YTDLP_BIN = (
+    os.environ.get("YTDLP_BIN")
+    or (os.path.exists(_VENV_YTDLP) and os.access(_VENV_YTDLP, os.X_OK) and _VENV_YTDLP)
+    or shutil.which("yt-dlp")
+    or "yt-dlp"
+)
+logger.info("Using yt-dlp binary: %s", YTDLP_BIN)
 # Run yt-dlp with lowest CPU priority so asyncio event loop gets CPU
-import os as _os
 _YTDLP_NICE = ["nice", "-n", "19"]
 
 # Global status for /status command
