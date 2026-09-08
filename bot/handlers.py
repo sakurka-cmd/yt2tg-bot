@@ -7,9 +7,10 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.types import Message, CallbackQuery
 
 from bot import database as db
+from bot import dl_queue
 from bot.states import States
 from bot.downloader import (
-    download_video, extract_video_id, extract_channel_id,
+    download_video, extract_video_id, extract_all_video_ids, extract_channel_id,
     get_video_info, get_channel_info, cleanup_file, current_status,
     extract_playlist_id, get_youtube_playlist_info, list_channel_videos,
     search_youtube, find_subtitle_path, download_subtitles, probe_duration,
@@ -168,6 +169,16 @@ def register_handlers(bot: AsyncTeleBot):
         else:
             lines.append("📋 Активных задач нет.")
 
+        # Download queue (FIFO waiting jobs)
+        try:
+            q = dl_queue.snapshot()
+            if q["waiting"]:
+                lines.append(f"\n⏳ Очередь скачивания ({len(q['waiting'])}):")
+                for i, j in enumerate(q["waiting"], 1):
+                    lines.append(f"  {i}. {j['title'][:45]} ({j['source']})")
+        except Exception:
+            pass
+
         # Backfill task status
         uid = msg.from_user.id
         if uid in backfill_tasks:
@@ -306,6 +317,17 @@ def register_handlers(bot: AsyncTeleBot):
                 msg,
                 "⏹ Отменяю текущую загрузку...\n"
                 "Бот остановится после текущего видео (может занять до минуты).",
+            )
+            return
+        # Remove this user's jobs that are still WAITING in the download queue
+        removed = dl_queue.remove_for_user(uid)
+        if removed:
+            names = "; ".join(j.short_title(40) for j in removed[:5])
+            extra = f" (и ещё {len(removed) - 5})" if len(removed) > 5 else ""
+            await bot.reply_to(
+                msg,
+                f"⏹ Убрано из очереди скачивания: {len(removed)}\n{names}{extra}\n"
+                f"Активная загрузка не прерывается — дождитесь её окончания или /status.",
             )
             return
         state, _ = await db.get_fsm_state(uid)
@@ -485,16 +507,36 @@ def register_handlers(bot: AsyncTeleBot):
                     )
                     await db.save_fsm_state(uid, States.SUB_CONFIRM, data)
                 elif state == States.DL_ASK_QUALITY:
-                    title = data.get("title", "Видео")
-                    await bot.edit_message_text(
-                        f"Качество: {QUALITY_LABELS[quality]}\n\n"
-                        f"Начинаю загрузку:\n{title}\n\n"
-                        f"Плейлист будет создан по имени канала автоматически.",
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                    )
-                    await db.clear_fsm_state(uid)
-                    asyncio.create_task(_process_oneoff(uid, data))
+                    batch = data.get("batch")
+                    if batch:
+                        # Multiple links from one message — queue them all
+                        await bot.edit_message_text(
+                            f"Качество: {QUALITY_LABELS[quality]}\n"
+                            f"Видео в очереди: {len(batch)}\n\n"
+                            f"Добавляю все видео в очередь скачивания...",
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                        )
+                        await db.clear_fsm_state(uid)
+                        for item in batch:
+                            item_data = {
+                                "url": item["url"],
+                                "youtube_id": item["youtube_id"],
+                                "title": item.get("title") or item["youtube_id"],
+                                "quality": quality,
+                            }
+                            asyncio.create_task(_process_oneoff(uid, item_data))
+                    else:
+                        title = data.get("title", "Видео")
+                        await bot.edit_message_text(
+                            f"Качество: {QUALITY_LABELS[quality]}\n\n"
+                            f"Начинаю загрузку:\n{title}\n\n"
+                            f"Плейлист будет создан по имени канала автоматически.",
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                        )
+                        await db.clear_fsm_state(uid)
+                        asyncio.create_task(_process_oneoff(uid, data))
                 elif state == States.DLPL_ASK_QUALITY:
                     pl_title = data.get("playlist_title", "YouTube Playlist")
                     await bot.edit_message_text(
@@ -1069,25 +1111,47 @@ def register_handlers(bot: AsyncTeleBot):
                 )
 
             elif state == States.DL_ASK_URL:
-                yt_id = extract_video_id(text)
-                if not yt_id:
+                yt_ids = extract_all_video_ids(text)
+                if not yt_ids:
                     await bot.reply_to(msg, "Не удалось распознать ссылку на видео.")
                     return
-                await bot.reply_to(msg, "Получаю информацию о видео...")
-                try:
-                    info = await get_video_info(text)
-                except Exception as e:
-                    logger.error("get_video_info error: %s", e)
-                    info = None
-                title = info["title"] if info else yt_id
-                data["url"] = text
-                data["youtube_id"] = yt_id
-                data["title"] = title
-                await db.save_fsm_state(uid, States.DL_ASK_QUALITY, data)
-                await bot.reply_to(
-                    msg, f"Видео: {title}\nВыберите качество:",
-                    reply_markup=quality_keyboard(),
-                )
+                if len(yt_ids) == 1:
+                    # Single link — existing flow
+                    yt_id = yt_ids[0]
+                    await bot.reply_to(msg, "Получаю информацию о видео...")
+                    try:
+                        info = await get_video_info(text)
+                    except Exception as e:
+                        logger.error("get_video_info error: %s", e)
+                        info = None
+                    title = info["title"] if info else yt_id
+                    data["url"] = text
+                    data["youtube_id"] = yt_id
+                    data["title"] = title
+                    await db.save_fsm_state(uid, States.DL_ASK_QUALITY, data)
+                    await bot.reply_to(
+                        msg, f"Видео: {title}\nВыберите качество:",
+                        reply_markup=quality_keyboard(),
+                    )
+                else:
+                    # Several links in one message — batch download:
+                    # ask quality once, then queue every video.
+                    batch = []
+                    for vid in yt_ids:
+                        batch.append({
+                            "url": f"https://www.youtube.com/watch?v={vid}",
+                            "youtube_id": vid,
+                            "title": vid,
+                        })
+                    data["batch"] = batch
+                    await db.save_fsm_state(uid, States.DL_ASK_QUALITY, data)
+                    await bot.reply_to(
+                        msg,
+                        f"🎬 Распознано видео: {len(batch)}\n"
+                        f"Выберите качество — оно применится ко всем,\n"
+                        f"и все видео встанут в очередь скачивания:",
+                        reply_markup=quality_keyboard(),
+                    )
 
             elif state == States.DLPL_ASK_URL:
                 pl_id = extract_playlist_id(text)
@@ -1373,10 +1437,34 @@ def register_handlers(bot: AsyncTeleBot):
                 pl = await find_or_create_playlist(channel_handle)
                 playlist_id = pl.get("id", "") if pl else ""
 
-            file_path = await download_video(url, quality)
-            if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED":
+            # Dedup pre-check: this exact video is already downloading or waiting
+            if dl_queue.find(yt_id):
+                await bot.send_message(
+                    user_id,
+                    f"⏳ Это видео уже скачивается или стоит в очереди: {title}",
+                )
+                return
+            # UX hint: the queue is not empty — this video will wait its turn
+            if dl_queue.queue_len():
+                await bot.send_message(
+                    user_id,
+                    f"⏳ В очереди на скачивание перед этим видео: {dl_queue.queue_len()}. "
+                    f"Положение в очереди: /status",
+                )
+
+            file_path = await download_video(
+                url, quality,
+                meta={"title": title, "user_id": user_id, "source": "oneoff"},
+            )
+            if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
                 if file_path == "TOO_LARGE":
                     await bot.send_message(user_id, f"⚠️ Файл слишком большой: {title}")
+                elif file_path == "DUPLICATE":
+                    # Lost the race — another task queued the same video between
+                    # our pre-check and download_video's own registration.
+                    await bot.send_message(user_id, f"⏳ Это видео уже скачивается или стоит в очереди: {title}")
+                elif file_path == "CANCELLED":
+                    await bot.send_message(user_id, f"⏹ Загрузка была убрана из очереди (/cancel): {title}")
                 elif file_path == "PERMANENT_FAIL":
                     # yt-dlp detected a permanent failure (live event not started,
                     # premiere scheduled, private/deleted, members-only). Tell
@@ -1573,6 +1661,7 @@ def register_handlers(bot: AsyncTeleBot):
 
             uploaded_count = 0
             failed_count = 0
+            skipped_dup = 0
             for i, v in enumerate(to_download, 1):
                 if backfill_tasks.get(user_id, {}).get("cancel"):
                     await bot.send_message(
@@ -1590,14 +1679,27 @@ def register_handlers(bot: AsyncTeleBot):
                 try:
                     await bot.send_message(user_id, f"[{i}/{len(to_download)}] ⬇ {title}")
 
-                    file_path = await download_video(url, quality)
-                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED":
+                    file_path = await download_video(
+                        url, quality,
+                        meta={"title": title, "user_id": user_id, "source": "dl_playlist"},
+                    )
+                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
                         if file_path == "TOO_LARGE":
                             await db.mark_video_processed(yt_id, None, title, quality, "")
                         elif file_path == "PERMANENT_FAIL":
                             # Live event / premiere / private — skip permanently
                             await db.mark_video_processed(yt_id, None, title, quality, "")
                             await db.mark_video_user_deleted(yt_id)
+                        elif file_path == "DUPLICATE":
+                            # Another download (user /dl or scheduler) already has
+                            # this video — not an error, just skip it this time.
+                            logger.info("dl_playlist: %s already queued by another download — skipping", yt_id)
+                            skipped_dup += 1
+                            continue
+                        elif file_path == "CANCELLED":
+                            logger.info("dl_playlist: %s cancelled from queue — skipping", yt_id)
+                            skipped_dup += 1
+                            continue
                         elif file_path == "NO_SPACE":
                             # Disk full — don't mark, retry next cycle
                             logger.error("Disk full during /backfill — skipping %s, will retry", yt_id)
@@ -1639,7 +1741,8 @@ def register_handlers(bot: AsyncTeleBot):
                 f"Плейлист: «{vh_playlist_name}»\n"
                 f"Загружено: {uploaded_count}\n"
                 f"Ошибок: {failed_count}\n"
-                f"Уже было: {already_done}",
+                + (f"Пропущено (уже в очереди): {skipped_dup}\n" if skipped_dup else "")
+                + f"Уже было: {already_done}",
             )
 
         except Exception as e:
@@ -1749,6 +1852,7 @@ def register_handlers(bot: AsyncTeleBot):
 
             uploaded_count = 0
             failed_count = 0
+            skipped_dup = 0
             for i, v in enumerate(to_download, 1):
                 if backfill_tasks.get(user_id, {}).get("cancel"):
                     await bot.send_message(user_id, f"⏹ Отменено. Загружено: {uploaded_count}, ошибок: {failed_count}")
@@ -1762,14 +1866,25 @@ def register_handlers(bot: AsyncTeleBot):
 
                 try:
                     await bot.send_message(user_id, f"[{i}/{len(to_download)}] ⬇ {title}")
-                    file_path = await download_video(url, quality)
-                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED":
+                    file_path = await download_video(
+                        url, quality,
+                        meta={"title": title, "user_id": user_id, "source": "backfill"},
+                    )
+                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
                         if file_path == "TOO_LARGE":
                             await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                         elif file_path == "PERMANENT_FAIL":
                             # Live event / premiere / private — skip permanently
                             await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                             await db.mark_video_user_deleted(yt_id)
+                        elif file_path == "DUPLICATE":
+                            logger.info("backfill: %s already queued by another download — skipping", yt_id)
+                            skipped_dup += 1
+                            continue
+                        elif file_path == "CANCELLED":
+                            logger.info("backfill: %s cancelled from queue — skipping", yt_id)
+                            skipped_dup += 1
+                            continue
                         elif file_path == "NO_SPACE":
                             # Disk full — don't mark, retry next cycle
                             logger.error("Disk full during /backfill — skipping %s, will retry", yt_id)
@@ -1809,7 +1924,9 @@ def register_handlers(bot: AsyncTeleBot):
             await bot.send_message(
                 user_id,
                 f"🏁 Загрузка архива завершена!\nКанал: «{sub_title}»\nПериод: {period_label}\n"
-                f"Загружено: {uploaded_count}\nОшибок: {failed_count}\nУже было: {already_done}",
+                f"Загружено: {uploaded_count}\nОшибок: {failed_count}\n"
+                + (f"Пропущено (уже в очереди): {skipped_dup}\n" if skipped_dup else "")
+                + f"Уже было: {already_done}",
             )
 
         except Exception as e:
@@ -1821,3 +1938,4 @@ def register_handlers(bot: AsyncTeleBot):
         finally:
             backfill_tasks.pop(user_id, None)
             current_status.update({"task": "", "progress": "", "error": "", "url": "", "title": ""})
+
