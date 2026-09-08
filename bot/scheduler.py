@@ -318,17 +318,26 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
         # avoid hammering YouTube and triggering more 429s.
         DOWNLOAD_RETRY_ATTEMPTS = 2
         DOWNLOAD_RETRY_BACKOFF_SEC = 15
+        # Sentinels that must NOT be retried (queue dedup: another download
+        # already has this video — the scheduler will just try again next cycle)
+        NO_RETRY_SENTINELS = ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED", "DUPLICATE", "CANCELLED")
         file_path = None
         for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
-            file_path = await download_video(yt_url, quality)
+            file_path = await download_video(
+                yt_url, quality,
+                meta={"title": title, "user_id": 0, "source": "scheduler"},
+            )
             # Success or non-retryable: stop retrying
-            if file_path and file_path not in ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED"):
+            if file_path and file_path not in NO_RETRY_SENTINELS:
                 break
-            if file_path in ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED"):
+            if file_path in NO_RETRY_SENTINELS:
                 # NO_SPACE is not retried here — retrying immediately would
                 # just hit the same disk-full condition. Skip this cycle,
                 # retry on the next subscription run (1 hour later) after
                 # the operator (or the pre-flight cleanup) frees up space.
+                # DUPLICATE means the video is already being downloaded by
+                # another job (user /dl, backfill) — next cycle the DB
+                # processed-check will see it if that download succeeded.
                 break
             # Transient None — retry with backoff
             if attempt < DOWNLOAD_RETRY_ATTEMPTS:
@@ -336,7 +345,7 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
                             yt_id, attempt, DOWNLOAD_RETRY_ATTEMPTS, DOWNLOAD_RETRY_BACKOFF_SEC)
                 await asyncio.sleep(DOWNLOAD_RETRY_BACKOFF_SEC)
 
-        if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED":
+        if not file_path or file_path in NO_RETRY_SENTINELS:
             # Build a human-readable failure reason for the admin report.
             # Each failure includes the original YouTube URL so the admin
             # can click and retry manually, or understand what was skipped.
@@ -350,6 +359,12 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
                 logger.warning("Permanent failure for %s — marking as user-deleted: %s", yt_id, title)
                 await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                 await db.mark_video_user_deleted(yt_id)
+            elif file_path == "DUPLICATE":
+                reason = "уже скачивается другим запросом (очередь)"
+                logger.info("Video %s already queued by another download — will verify next cycle", yt_id)
+            elif file_path == "CANCELLED":
+                reason = "убрано из очереди (/cancel)"
+                logger.info("Video %s cancelled from queue — will retry next cycle", yt_id)
             elif file_path == "NO_SPACE":
                 reason = "нет места на диске сервера"
                 logger.error("Disk full — skipping %s (%s) this cycle, will retry next cycle", yt_id, title)

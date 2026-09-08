@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR
+from bot import dl_queue
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,20 @@ current_status: dict = {
 def extract_video_id(url: str) -> str | None:
     m = YOUTUBE_URL_RE.search(url)
     return m.group(1) if m else None
+
+
+def extract_all_video_ids(text: str) -> list[str]:
+    """Extract ALL unique YouTube video ids from a message.
+    Lets the bot accept several links pasted in a row (or in one message)
+    and queue them all instead of silently taking only the first/last."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in YOUTUBE_URL_RE.finditer(text or ""):
+        vid = m.group(1)
+        if vid not in seen:
+            seen.add(vid)
+            out.append(vid)
+    return out
 
 
 def extract_channel_id(url: str) -> str | None:
@@ -215,7 +230,8 @@ async def _get_channel_info_rss(url: str) -> dict | None:
     return None
 
 
-async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None:
+async def download_video(url: str, quality: str = DEFAULT_QUALITY,
+                         meta: dict | None = None) -> str | None:
     """Download video, return path. Caller must delete. Returns 'TOO_LARGE' if too big.
 
     Only the video is downloaded here — subtitles are fetched separately via
@@ -223,7 +239,48 @@ async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None
     the video download (yt-dlp exits non-zero on subtitle 429 even though the
     video itself downloaded fine, and on some videos it bails BEFORE starting
     the video download, leaving the user with nothing).
+
+    All downloads are serialized through the global queue (bot.dl_queue):
+    concurrent callers wait FIFO on DL_LOCK, and a second request for the
+    SAME video returns "DUPLICATE" instead of corrupting the running one.
+    Additional sentinels: "DUPLICATE", "CANCELLED".
+
+    meta (optional): {"title": str, "user_id": int, "source": str}
+    used for the /status queue view and dedup messages.
     """
+    yt_id0 = extract_video_id(url) or "unknown"
+    m = meta or {}
+    try:
+        pos = dl_queue.enqueue(
+            yt_id0, url=url,
+            title=m.get("title") or yt_id0,
+            user_id=m.get("user_id") or 0,
+            source=m.get("source") or "unknown",
+        )
+    except dl_queue.AlreadyQueuedError:
+        logger.info("Download %s skipped: already active or queued (dedup)", yt_id0)
+        return "DUPLICATE"
+    if pos > 0:
+        logger.info("Download %s enqueued, %d job(s) ahead", yt_id0, pos)
+
+    try:
+        async with dl_queue.DL_LOCK:
+            # /cancel may have removed us from the queue while we waited
+            if not dl_queue.set_active(yt_id0):
+                logger.info("Download %s was removed from the queue (/cancel) — aborting", yt_id0)
+                return "CANCELLED"
+            try:
+                return await _download_video_locked(url, quality, yt_id0)
+            finally:
+                dl_queue.release(yt_id0)
+    finally:
+        dl_queue.discard(yt_id0)
+
+
+async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | None:
+    """Actual yt-dlp run. Called ONLY with dl_queue.DL_LOCK held — exactly one
+    instance of this coroutine exists at any moment (pre-flight cleanup of
+    stale .part files is safe under this invariant)."""
     global current_status
     os.makedirs(TMP_DIR, exist_ok=True)
 
@@ -241,11 +298,11 @@ async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None
     #
     # Cleanup strategy:
     # 1. Before each download, remove ALL stale *.part / *.temp.* / *.f*.mp4
-    #    files. The bot is single-threaded — only one download runs at a
-    #    time — so ANY .part file is stale. (Previously only files older
-    #    than 1 hour were touched, but a .part file can grow to 4+ GB in
-    #    under an hour on long videos, filling the disk before cleanup
-    #    kicks in.)
+    #    files. Only one download runs at a time — download_video() is
+    #    serialized by the global queue (bot.dl_queue, DL_LOCK) — so ANY
+    #    .part file is stale. (Previously only files older than 1 hour were
+    #    touched, but a .part file can grow to 4+ GB in under an hour on
+    #    long videos, filling the disk before cleanup kicks in.)
     # 2. Check free space on TMP_DIR's filesystem. If less than 4 GB free,
     #    refuse to start the download and return a clear error rather than
     #    letting yt-dlp fail mid-way with a cryptic errno 28.
@@ -308,7 +365,6 @@ async def download_video(url: str, quality: str = DEFAULT_QUALITY) -> str | None
     if MAX_FILE_SIZE and MAX_FILE_SIZE != "0":
         cmd.extend(["--max-filesize", MAX_FILE_SIZE])
 
-    yt_id = extract_video_id(url) or "unknown"
     current_status.update({"task": "download", "url": url, "title": yt_id, "progress": "0%", "error": ""})
     logger.info("Downloading: %s (quality: %s)", url, quality)
 
@@ -783,3 +839,4 @@ async def search_youtube(query: str, max_results: int = 20) -> list[dict]:
     except Exception as e:
         logger.error("yt-dlp search error: %s", e)
         return []
+
