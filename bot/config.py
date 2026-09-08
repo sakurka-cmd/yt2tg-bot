@@ -27,6 +27,14 @@ TMP_DIR: str = os.environ.get("TMP_DIR", "/tmp/yt2tg")
 MAX_FILE_SIZE: str = os.environ.get("MAX_FILE_SIZE", "2G")
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 
+# Path to a Netscape-format cookies.txt exported from a logged-in YouTube
+# account (see README section "Cookies / возрастные ограничения").
+# Needed for age-restricted videos: YouTube replies
+# "Sign in to confirm your age" without authentication no matter which
+# player client yt-dlp uses. Empty = no cookies (age-restricted videos
+# fail with the AGE_RESTRICTED sentinel and a clear message).
+YTDLP_COOKIES: str = os.environ.get("YTDLP_COOKIES", "")
+
 DEFAULT_QUALITY = "720"
 
 QUALITIES = {

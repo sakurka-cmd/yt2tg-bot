@@ -7,7 +7,7 @@ import re
 import shutil
 from pathlib import Path
 
-from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR
+from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR, YTDLP_COOKIES
 from bot import dl_queue
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,16 @@ logger.info("Using yt-dlp binary: %s", YTDLP_BIN)
 # Run yt-dlp with lowest CPU priority so asyncio event loop gets CPU
 _YTDLP_NICE = ["nice", "-n", "19"]
 
+# Shared yt-dlp flags for authenticated requests. Applied to EVERY yt-dlp
+# invocation (info, channel info, download, subtitles) so that one-off /dl
+# requests behave exactly like scheduler downloads.
+_YTDLP_COMMON_ARGS: list[str] = ["--impersonate", "chrome"]
+if YTDLP_COOKIES:
+    # Netscape-format cookies.txt from a logged-in YouTube account — the only
+    # reliable way to download age-restricted videos ("Sign in to confirm
+    # your age"). No player client bypasses the age gate.
+    _YTDLP_COMMON_ARGS += ["--cookies", YTDLP_COOKIES]
+
 # Global status for /status command
 current_status: dict = {
     "task": "",
@@ -89,14 +99,17 @@ def get_format_string(quality: str) -> str:
 
 
 async def get_video_info(url: str) -> dict | None:
-    cmd = [YTDLP_BIN, "--dump-json", "--no-download", "--no-playlist", "--no-warnings", url]
+    cmd = [YTDLP_BIN, "--dump-json", "--no-download", "--no-playlist", "--no-warnings",
+           *_YTDLP_COMMON_ARGS, url]
     try:
         proc = await asyncio.create_subprocess_exec(
             *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0:
-            logger.error("yt-dlp info failed: %s", stderr.decode(errors="replace")[:500])
+            err = stderr.decode(errors="replace")[:500]
+            logger.error("yt-dlp info failed: %s", err)
+            current_status["error"] = err[:200]
             return None
         import json
         info = json.loads(stdout.decode())
@@ -169,6 +182,7 @@ async def get_channel_info(url: str) -> dict | None:
         YTDLP_BIN, "--dump-json", "--no-download",
         "--playlist-items", "1",  # only fetch first video to save time
         "--no-warnings",
+        *_YTDLP_COMMON_ARGS,
         url,
     ]
     try:
@@ -353,8 +367,9 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
         # Impersonate Chrome at the TLS layer (curl_cffi backend). YouTube
         # returns HTTP 429 to plain requests on some videos — impersonation
         # makes the requests look like a real browser and largely avoids
-        # the 429 path. curl_cffi must be installed in the system Python.
-        "--impersonate", "chrome",
+        # the 429 path. (Also carries --cookies when YTDLP_COOKIES is set,
+        # e.g. for age-restricted videos.)
+        *_YTDLP_COMMON_ARGS,
         # Be tolerant of transient network errors — YouTube throttles
         # aggressively and a single failed fragment shouldn't kill the whole
         # download.
@@ -440,16 +455,24 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
             if "no space left on device" in err_clean.lower() or "errno 28" in err_clean.lower():
                 logger.error("Disk full during download of %s — not marking as processed, will retry next cycle", yt_id)
                 return "NO_SPACE"
+            # Detect age-restricted videos — "Sign in to confirm your age".
+            # YouTube requires an authenticated session (cookies) for these,
+            # and no player client bypasses the age gate. Permanent without
+            # cookies, so a dedicated sentinel lets callers report it clearly
+            # instead of endlessly retrying like the anti-bot challenge.
+            err_lower = err_clean.lower()
+            if "confirm your age" in err_lower or "inappropriate for some users" in err_lower:
+                logger.warning("Age-restricted video %s — needs cookies (YTDLP_COOKIES)", yt_id)
+                return "AGE_RESTRICTED"
             # Detect YouTube anti-bot challenge — "Sign in to confirm you're
             # not a bot". This is NOT permanent (YouTube turns it on/off
             # periodically) and NOT a simple transient error. Return a
             # dedicated sentinel so the scheduler can report it clearly and
             # retry on the next cycle without marking as processed.
-            if "sign in to confirm" in err_clean.lower() or "not a bot" in err_clean.lower():
+            if "sign in to confirm" in err_lower or "not a bot" in err_lower:
                 logger.warning("YouTube anti-bot challenge for %s — will retry next cycle", yt_id)
                 return "AUTH_REQUIRED"
             # Detect permanent failures — the video will NEVER be downloadable
-            err_lower = err_clean.lower()
             PERMANENT_PATTERNS = [
                 "this live event will begin",      # upcoming live / premiere
                 "live event has not started",
@@ -574,7 +597,7 @@ async def download_subtitles(url: str, yt_id: str) -> str | None:
         "--sub-format", "vtt", "--convert-subs", "vtt",
         "--skip-download",          # only subtitles, no video
         "--no-playlist", "--no-warnings", "--no-cache-dir",
-        "--impersonate", "chrome",  # same impersonation as the video command
+        *_YTDLP_COMMON_ARGS,         # same impersonation/cookies as the video command
         "--retries", "5",
         "-o", output_template,
         url,

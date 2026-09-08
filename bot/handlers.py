@@ -1456,7 +1456,7 @@ def register_handlers(bot: AsyncTeleBot):
                 url, quality,
                 meta={"title": title, "user_id": user_id, "source": "oneoff"},
             )
-            if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
+            if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED" or file_path == "AGE_RESTRICTED":
                 if file_path == "TOO_LARGE":
                     await bot.send_message(user_id, f"⚠️ Файл слишком большой: {title}")
                 elif file_path == "DUPLICATE":
@@ -1497,6 +1497,18 @@ def register_handlers(bot: AsyncTeleBot):
                         f"Срабатывает анти-бот защита (\"Sign in to confirm you're not a bot\").\n"
                         f"Это временно — попробуйте позже."
                     )
+                elif file_path == "AGE_RESTRICTED":
+                    # Age-restricted video: YouTube requires an authenticated
+                    # session (cookies). Without YTDLP_COOKIES configured this
+                    # is permanent — tell the user instead of endlessly
+                    # retrying, and mark the video so subscriptions don't loop.
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ Видео с возрастным ограничением: {title}\n\n"
+                        f"YouTube требует авторизацию (\"Sign in to confirm your age\").\n"
+                        f"Такие видео скачиваются только с cookies — см. README (\"Cookies\")."
+                    )
+                    await db.mark_video_user_deleted(yt_id)
                 else:
                     err_detail = current_status.get("error", "")[:200]
                     await bot.send_message(
@@ -1683,11 +1695,15 @@ def register_handlers(bot: AsyncTeleBot):
                         url, quality,
                         meta={"title": title, "user_id": user_id, "source": "dl_playlist"},
                     )
-                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
+                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED" or file_path == "AGE_RESTRICTED":
                         if file_path == "TOO_LARGE":
                             await db.mark_video_processed(yt_id, None, title, quality, "")
                         elif file_path == "PERMANENT_FAIL":
                             # Live event / premiere / private — skip permanently
+                            await db.mark_video_processed(yt_id, None, title, quality, "")
+                            await db.mark_video_user_deleted(yt_id)
+                        elif file_path == "AGE_RESTRICTED":
+                            # Age-restricted — permanent without cookies
                             await db.mark_video_processed(yt_id, None, title, quality, "")
                             await db.mark_video_user_deleted(yt_id)
                         elif file_path == "DUPLICATE":
@@ -1870,11 +1886,15 @@ def register_handlers(bot: AsyncTeleBot):
                         url, quality,
                         meta={"title": title, "user_id": user_id, "source": "backfill"},
                     )
-                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED":
+                    if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED" or file_path == "AGE_RESTRICTED":
                         if file_path == "TOO_LARGE":
                             await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                         elif file_path == "PERMANENT_FAIL":
                             # Live event / premiere / private — skip permanently
+                            await db.mark_video_processed(yt_id, sub_id, title, quality, "")
+                            await db.mark_video_user_deleted(yt_id)
+                        elif file_path == "AGE_RESTRICTED":
+                            # Age-restricted — permanent without cookies
                             await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                             await db.mark_video_user_deleted(yt_id)
                         elif file_path == "DUPLICATE":
