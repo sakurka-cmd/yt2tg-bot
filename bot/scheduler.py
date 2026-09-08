@@ -320,7 +320,7 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
         DOWNLOAD_RETRY_BACKOFF_SEC = 15
         # Sentinels that must NOT be retried (queue dedup: another download
         # already has this video — the scheduler will just try again next cycle)
-        NO_RETRY_SENTINELS = ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED", "DUPLICATE", "CANCELLED")
+        NO_RETRY_SENTINELS = ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED", "AGE_RESTRICTED", "DUPLICATE", "CANCELLED")
         file_path = None
         for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
             file_path = await download_video(
@@ -371,6 +371,14 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
             elif file_path == "AUTH_REQUIRED":
                 reason = "YouTube анти-бот защита (требуется вход / cookies)"
                 logger.warning("YouTube anti-bot challenge for %s — will retry next cycle", yt_id)
+            elif file_path == "AGE_RESTRICTED":
+                # Age-restricted video: YouTube requires an authenticated
+                # session. Permanent without cookies — mark as processed /
+                # user-deleted so the scheduler stops retrying it every cycle.
+                reason = "возрастное ограничение (нужны cookies, см. README)"
+                logger.warning("Age-restricted video %s — marking as user-deleted (no cookies configured): %s", yt_id, title)
+                await db.mark_video_processed(yt_id, sub_id, title, quality, "")
+                await db.mark_video_user_deleted(yt_id)
             else:
                 # Plain None — transient error (network, 403, 429, etc.)
                 err_detail = current_status.get("error", "")[:120]
