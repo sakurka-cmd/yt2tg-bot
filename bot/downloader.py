@@ -134,6 +134,10 @@ async def get_video_info(url: str) -> dict | None:
             "filesize_approx": info.get("filesize_approx", 0),
             # yt-dlp returns upload_date as YYYYMMDD string
             "upload_date": info.get("upload_date", ""),
+            # live/premiere state — used to skip streams that never EOF
+            "is_live": bool(info.get("is_live")),
+            "live_status": info.get("live_status", ""),
+            "was_live": bool(info.get("was_live")),
         }
     except asyncio.TimeoutError:
         logger.error("yt-dlp info timeout for %s", url)
@@ -296,6 +300,20 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
     instance of this coroutine exists at any moment (pre-flight cleanup of
     stale .part files is safe under this invariant)."""
     global current_status
+
+    # Guard: never start a live/upcoming/post-live stream. yt-dlp records the
+    # HLS DVR manifest and never reaches EOF, blocking the serialized queue for
+    # hours (a live premiere on 2026-09-12 hung the queue ~24h). Skip and let
+    # the scheduler retry later — a premiere becomes a normal VOD afterwards.
+    _info = await get_video_info(url)
+    if _info:
+        _ls = (_info.get("live_status") or "").lower()
+        if _info.get("is_live") or _ls in ("is_live", "is_upcoming", "post_live"):
+            logger.warning("Skip live/upcoming stream %s (live_status=%s): %s", yt_id, _ls, url)
+            current_status.update({"task": "", "progress": "",
+                                   "error": f"live skipped ({_ls or 'is_live'})"})
+            return None
+
     os.makedirs(TMP_DIR, exist_ok=True)
 
     # ── Disk space pre-flight + stale file cleanup ────────────────────────
@@ -387,8 +405,28 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
         proc = await asyncio.create_subprocess_exec(
             *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 3 * 3600  # hard cap: 3h per download
         while True:
-            line = await proc.stdout.readline()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.error("Download %s exceeded 3h cap — killing yt-dlp", yt_id)
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                current_status["error"] = "download timeout (3h cap)"
+                current_status["task"] = ""
+                current_status["progress"] = ""
+                return None
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, 300))
+            except asyncio.TimeoutError:
+                continue
             if not line:
                 break
             text = line.decode(errors="replace").strip()
