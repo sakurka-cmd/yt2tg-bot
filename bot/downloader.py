@@ -59,14 +59,51 @@ if YTDLP_COOKIES:
     # your age"). No player client bypasses the age gate.
     _YTDLP_COMMON_ARGS += ["--cookies", YTDLP_COOKIES]
 
-# Global status for /status command
-current_status: dict = {
-    "task": "",
-    "url": "",
-    "title": "",
-    "progress": "",
-    "error": "",
-}
+# Thread-safe status for /status command
+class DownloadStatus:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._status = {
+            "task": "",
+            "url": "",
+            "title": "",
+            "progress": "",
+            "error": "",
+        }
+
+    async def update(self, **kwargs):
+        async with self._lock:
+            self._status.update(kwargs)
+
+    async def get(self) -> dict:
+        async with self._lock:
+            return self._status.copy()
+
+    async def clear(self):
+        async with self._lock:
+            self._status = {
+                "task": "",
+                "url": "",
+                "title": "",
+                "progress": "",
+                "error": "",
+            }
+
+    # Synchronous compatibility for legacy code
+    def __getitem__(self, key: str) -> str:
+        return self._status.get(key, "")
+
+    def __setitem__(self: str, key: str, value: str):
+        self._status[key] = value
+
+    def get_sync(self, key: str, default: str = "") -> str:
+        return self._status.get(key, default)
+
+    def update_sync(self, **kwargs):
+        self._status.update(kwargs)
+
+
+current_status = DownloadStatus()
 
 
 def extract_video_id(url: str) -> str | None:
@@ -549,19 +586,15 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
         return None
 
 
-def find_subtitle_path(yt_id: str) -> str | None:
+def find_subtitle_path(yt_id: str, lang: str = "ru") -> str | None:
     """Find the VTT subtitle sidecar file downloaded by yt-dlp for this video.
 
     yt-dlp writes subtitles as `<yt_id>.<lang>.vtt` (e.g. `dQw4w9WgXcQ.ru.vtt`).
-    Returns the path to the Russian subtitle if available, else the first .vtt
-    file matching this yt_id. Returns None if no subtitle was downloaded.
+    Returns the path to the subtitle in the specified language if available.
     """
     if not yt_id:
         return None
-    candidates = sorted(Path(TMP_DIR).glob(f"{yt_id}.ru.vtt"))
-    if candidates:
-        return str(candidates[0])
-    candidates = sorted(Path(TMP_DIR).glob(f"{yt_id}.*.vtt"))
+    candidates = sorted(Path(TMP_DIR).glob(f"{yt_id}.{lang}.vtt"))
     if candidates:
         return str(candidates[0])
     return None
@@ -613,8 +646,8 @@ def probe_duration(file_path: str) -> float | None:
     return None
 
 
-async def download_subtitles(url: str, yt_id: str) -> str | None:
-    """Download auto-generated Russian subtitles as a VTT sidecar file.
+async def download_subtitles(url: str, yt_id: str) -> list[dict]:
+    """Download auto-generated subtitles in multiple languages (ru, en) as VTT sidecar files.
 
     This is split from download_video() because yt-dlp, when asked to download
     both video and subtitles in one invocation, sometimes bails out on the
@@ -622,16 +655,16 @@ async def download_subtitles(url: str, yt_id: str) -> str | None:
     with nothing. By running subs as a separate `--skip-download` command,
     a 429 here only means "no subtitles" rather than "no video either".
 
-    Returns the path to the .vtt file (via find_subtitle_path), or None on
-    any failure. Never raises — subtitles are always optional.
+    Returns a list of dicts: [{"path": str, "language": str}, ...]
+    Empty list on failure. Never raises — subtitles are always optional.
     """
     if not yt_id:
-        return None
+        return []
     os.makedirs(TMP_DIR, exist_ok=True)
     output_template = os.path.join(TMP_DIR, "%(id)s.%(ext)s")
     cmd = [
         YTDLP_BIN,
-        "--write-auto-sub", "--sub-lang", "ru",
+        "--write-auto-sub", "--sub-lang", "ru,en",
         "--sub-format", "vtt", "--convert-subs", "vtt",
         "--skip-download",          # only subtitles, no video
         "--no-playlist", "--no-warnings", "--no-cache-dir",
@@ -649,15 +682,18 @@ async def download_subtitles(url: str, yt_id: str) -> str | None:
         logger.warning("Subtitle download timeout for %s", yt_id)
     except Exception as e:
         logger.warning("Subtitle download error for %s: %s", yt_id, e)
-    # yt-dlp returns non-zero if YouTube returns 429 for subtitles — that's
-    # fine, we just won't have subs for this video. The .vtt file may still
-    # have been partially written in some cases, so check for it.
-    sub = find_subtitle_path(yt_id)
-    if sub:
-        logger.info("Subtitles downloaded for %s: %s", yt_id, sub)
-    else:
+
+    # Find all subtitle files for this video
+    results = []
+    for lang in ["ru", "en"]:
+        sub = find_subtitle_path(yt_id, lang)
+        if sub:
+            results.append({"path": sub, "language": lang})
+            logger.info("Subtitles downloaded for %s: %s (%s)", yt_id, lang, sub)
+
+    if not results:
         logger.info("No subtitles for %s (429 or not available)", yt_id)
-    return sub
+    return results
 
 
 async def list_channel_videos(channel_url: str, max_count: int = 200) -> list[dict]:

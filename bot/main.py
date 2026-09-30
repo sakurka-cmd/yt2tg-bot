@@ -78,8 +78,32 @@ async def _register_commands_with_retry() -> None:
             await asyncio.sleep(delay)
 
 
+async def cleanup_stale_files():
+    """Remove stale .part and .temp files from previous runs."""
+    import glob
+    from datetime import datetime, timedelta
+    from bot.config import TMP_DIR
+
+    if not os.path.exists(TMP_DIR):
+        return
+
+    cutoff = datetime.now() - timedelta(hours=24)
+    patterns = ["*.part", "*.temp.*", "*.tmp", "*.ytdl"]
+
+    for pattern in patterns:
+        for filepath in glob.glob(os.path.join(TMP_DIR, pattern)):
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                if mtime < cutoff:
+                    os.unlink(filepath)
+                    logger.info("Cleaned up stale file: %s", filepath)
+            except Exception as e:
+                logger.warning("Failed to cleanup %s: %s", filepath, e)
+
+
 async def main():
     await db.init_db()
+    await cleanup_stale_files()
     logger.info("Bot started (admins: %s)", ADMIN_IDS)
 
     # Register commands with Telegram (shows in / command autocomplete).

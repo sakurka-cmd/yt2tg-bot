@@ -171,7 +171,7 @@ async def upload_video(file_path: str, title: str,
                        published_at: str = "",
                        thumbnail_url: str = "",
                        youtube_id: str = "",
-                       subtitle_path: str = "",
+                       subtitles: list[dict] | None = None,
                        duration: float | None = None) -> dict | None:
     """Upload video to VideoHost. Returns response dict or None.
 
@@ -181,9 +181,10 @@ async def upload_video(file_path: str, title: str,
     to /api/bot/upload-thumbnail (NOT as base64 in HTTP headers, which
     triggers HTTP 431 on ~400KB thumbnails).
     youtube_id: optional 11-char YouTube video ID.
-    subtitle_path: optional path to a local .vtt subtitle file. If provided,
-    the bot uploads it via /api/bot/upload-subtitle and passes the resulting
-    server-side filesystem path in x-subtitle-path to /api/bot/upload.
+    subtitles: optional list of [{"path": str, "language": str}, ...].
+    Each subtitle is uploaded via /api/bot/upload-subtitle and the resulting
+    server-side filesystem paths are passed in x-subtitle-paths (JSON array)
+    and x-subtitle-languages to /api/bot/upload.
     duration: optional video duration in seconds (from yt-dlp info["duration"]).
     Passed via x-duration header so the APK can show it on the thumbnail badge.
     """
@@ -205,12 +206,19 @@ async def upload_video(file_path: str, title: str,
     if thumb_path:
         thumb_fs_path = await upload_thumbnail(thumb_path)
 
-    # Upload subtitle separately (binary POST). yt-dlp downloads auto-generated
-    # Russian captions from YouTube; ExoPlayer can render VTT natively.
-    sub_fs_path = None
-    sub_lang = "ru"
-    if subtitle_path:
-        sub_fs_path = await upload_subtitle(subtitle_path, language=sub_lang)
+    # Upload subtitles separately (binary POST). yt-dlp downloads auto-generated
+    # captions from YouTube; ExoPlayer can render VTT natively.
+    sub_fs_paths = []
+    sub_langs = []
+    if subtitles:
+        for sub in subtitles:
+            path = sub.get("path", "")
+            lang = sub.get("language", "ru")
+            if path:
+                fs_path = await upload_subtitle(path, language=lang)
+                if fs_path:
+                    sub_fs_paths.append(fs_path)
+                    sub_langs.append(lang)
 
     current_status.update({
         "task": "upload", "title": title,
@@ -251,9 +259,10 @@ async def upload_video(file_path: str, title: str,
             # thumbnail route will detect and clear it later, then fall back
             # to ffmpeg generation from the video file).
             upload_headers["x-thumbnail-url"] = _enc(thumbnail_url)
-        if sub_fs_path:
-            upload_headers["x-subtitle-path"] = _enc(sub_fs_path)
-            upload_headers["x-subtitle-language"] = _enc(sub_lang)
+        if sub_fs_paths:
+            import json as _json
+            upload_headers["x-subtitle-paths"] = _enc(_json.dumps(sub_fs_paths))
+            upload_headers["x-subtitle-languages"] = _enc(_json.dumps(sub_langs))
 
         with open(file_path, "rb") as f:
             async with aiohttp.ClientSession() as session:
@@ -281,35 +290,52 @@ async def upload_video(file_path: str, title: str,
         return None
 
 
-async def video_exists(videohost_id: str) -> bool:
+async def video_exists(videohost_id: str, retries: int = 3) -> bool:
     """Check whether a previously uploaded video still exists on VideoHost.
 
     Used by the bot to detect when a video has been deleted on VideoHost
     (e.g. by an admin via the UI) so it can be re-uploaded instead of
     silently skipped due to the local processed_videos cache.
+
+    Retries up to `retries` times on transient errors with exponential backoff.
     """
     if not videohost_id:
         return False
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{VIDEOHOST_URL}/api/bot/videos/{videohost_id}",
-                headers=_headers(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
+
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{VIDEOHOST_URL}/api/bot/videos/{videohost_id}",
+                    headers=_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        return True
+                    if resp.status == 404:
+                        return False
+                    # Auth or other error — retry with backoff
+                    if attempt < retries - 1:
+                        wait = 2 ** attempt
+                        logger.warning("video_exists check returned %d for %s (attempt %d/%d), retrying in %ds",
+                                       resp.status, videohost_id, attempt + 1, retries, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    # Final attempt failed — be conservative, assume exists
+                    logger.warning("video_exists check returned %d for %s after %d attempts — assuming exists",
+                                   resp.status, videohost_id, retries)
                     return True
-                if resp.status == 404:
-                    return False
-                # Auth or other error — be conservative, assume exists
-                # so we don't accidentally re-upload
-                logger.warning("video_exists check returned %d for %s — assuming exists",
-                               resp.status, videohost_id)
-                return True
-    except Exception as e:
-        logger.warning("video_exists check failed for %s: %s — assuming exists",
-                       videohost_id, e)
-        return True
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                logger.warning("video_exists check failed for %s (attempt %d/%d): %s — retrying in %ds",
+                               videohost_id, attempt + 1, retries, e, wait)
+                await asyncio.sleep(wait)
+                continue
+            logger.warning("video_exists check failed for %s after %d attempts: %s — assuming exists",
+                           videohost_id, retries, e)
+            return True
+    return True
 
 
 async def sort_playlist(playlist_id: str) -> bool:

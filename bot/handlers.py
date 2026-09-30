@@ -1520,7 +1520,7 @@ def register_handlers(bot: AsyncTeleBot):
                     )
                 return
 
-            sub_path = await download_subtitles(url, yt_id) if yt_id else None
+            subtitles = await download_subtitles(url, yt_id) if yt_id else []
             # Duration: prefer yt-dlp info, fallback to ffprobe on the file
             dur = (info.get("duration") if info else None) or probe_duration(file_path)
             result = await upload_video(
@@ -1528,12 +1528,12 @@ def register_handlers(bot: AsyncTeleBot):
                 published_at=published_at,
                 thumbnail_url=thumbnail_url,
                 youtube_id=yt_id,
-                subtitle_path=sub_path or "",
+                subtitles=subtitles,
                 duration=dur,
             )
             cleanup_file(file_path)
-            if sub_path:
-                cleanup_file(sub_path)
+            for sub in subtitles:
+                cleanup_file(sub["path"])
 
             vh_id = result.get("id", "") if result else ""
             if vh_id:
@@ -1726,19 +1726,19 @@ def register_handlers(bot: AsyncTeleBot):
                         continue
 
                     yt_thumb = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
-                    sub_path = await download_subtitles(url, yt_id) if yt_id else None
+                    subtitles = await download_subtitles(url, yt_id) if yt_id else []
                     dur = v.get("duration") or probe_duration(file_path)
                     result = await upload_video(
                         file_path, title, playlist_id,
                         published_at=published_at,
                         thumbnail_url=yt_thumb,
                         youtube_id=yt_id,
-                        subtitle_path=sub_path or "",
+                        subtitles=subtitles,
                         duration=dur,
                     )
                     cleanup_file(file_path)
-                    if sub_path:
-                        cleanup_file(sub_path)
+                    for sub in subtitles:
+                        cleanup_file(sub["path"])
 
                     if result:
                         vh_id = result.get("id", "")
@@ -1915,19 +1915,19 @@ def register_handlers(bot: AsyncTeleBot):
                         continue
 
                     yt_thumb = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
-                    sub_path = await download_subtitles(url, yt_id) if yt_id else None
+                    subtitles = await download_subtitles(url, yt_id) if yt_id else []
                     dur = v.get("duration") or probe_duration(file_path)
                     result = await upload_video(
                         file_path, title, playlist_id or None,
                         published_at=published_at,
                         thumbnail_url=yt_thumb,
                         youtube_id=yt_id,
-                        subtitle_path=sub_path or "",
+                        subtitles=subtitles,
                         duration=dur,
                     )
                     cleanup_file(file_path)
-                    if sub_path:
-                        cleanup_file(sub_path)
+                    for sub in subtitles:
+                        cleanup_file(sub["path"])
 
                     if result:
                         vh_id = result.get("id", "")

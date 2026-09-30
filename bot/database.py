@@ -63,8 +63,24 @@ CREATE TABLE IF NOT EXISTS version_state (
     PRIMARY KEY (repo, key)
 );
 
+CREATE TABLE IF NOT EXISTS download_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL,
+    quality TEXT DEFAULT '720',
+    playlist_id TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    title TEXT DEFAULT '',
+    youtube_id TEXT DEFAULT '',
+    user_id INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'dl',
+    created_at TEXT DEFAULT (datetime('now')),
+    started_at TEXT DEFAULT '',
+    completed_at TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_processed_ytid ON processed_videos(youtube_id);
 CREATE INDEX IF NOT EXISTS idx_subs_active ON subscriptions(active, channel_id);
+CREATE INDEX IF NOT EXISTS idx_queue_status ON download_queue(status);
 """
 
 
@@ -340,6 +356,81 @@ async def update_task_status(task_id: int, status: str, **kwargs):
         vals,
     )
     await db.commit()
+
+
+# ── Download queue (persistent) ─────────────────────────────────
+
+async def save_queue(items: list[dict]):
+    """Save the entire download queue to SQLite (replaces existing)."""
+    db = get_db()
+    await db.execute("DELETE FROM download_queue WHERE status IN ('pending', 'downloading')")
+    for item in items:
+        await db.execute(
+            """INSERT INTO download_queue (url, quality, playlist_id, status, title, youtube_id, user_id, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (item.get("url", ""), item.get("quality", "720"), item.get("playlist_id", ""),
+             item.get("status", "pending"), item.get("title", ""), item.get("youtube_id", ""),
+             item.get("user_id", 0), item.get("source", "dl"), item.get("created_at", "")),
+        )
+    await db.commit()
+
+
+async def load_queue() -> list[dict]:
+    """Load pending/downloading items from SQLite."""
+    db = get_db()
+    cur = await db.execute(
+        "SELECT * FROM download_queue WHERE status IN ('pending', 'downloading') ORDER BY created_at"
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def add_queue_item(url: str, quality: str = "720", playlist_id: str = "",
+                       title: str = "", youtube_id: str = "", user_id: int = 0,
+                       source: str = "dl") -> int:
+    """Add item to download queue."""
+    db = get_db()
+    cur = await db.execute(
+        """INSERT INTO download_queue (url, quality, playlist_id, status, title, youtube_id, user_id, source)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (url, quality, playlist_id, title, youtube_id, user_id, source),
+    )
+    await db.commit()
+    return cur.lastrowid
+
+
+async def update_queue_item(queue_id: int, status: str, **kwargs):
+    """Update queue item status and optional fields."""
+    db = get_db()
+    sets = ["status=?"]
+    vals = [status]
+    for k, v in kwargs.items():
+        sets.append(f"{k}=?")
+        vals.append(v)
+    vals.append(queue_id)
+    await db.execute(
+        f"UPDATE download_queue SET {', '.join(sets)} WHERE id=?",
+        vals,
+    )
+    await db.commit()
+
+
+async def remove_queue_item(queue_id: int):
+    """Remove item from queue."""
+    db = get_db()
+    await db.execute("DELETE FROM download_queue WHERE id=?", (queue_id,))
+    await db.commit()
+
+
+async def get_queue_items(status: str = "pending") -> list[dict]:
+    """Get queue items by status."""
+    db = get_db()
+    cur = await db.execute(
+        "SELECT * FROM download_queue WHERE status=? ORDER BY created_at",
+        (status,),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def get_pending_task(user_id: int) -> dict | None:

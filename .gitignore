@@ -6,3 +6,10 @@ __pycache__/
 *.bak*
 *.bak
 cookies.txt
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.part
+*.temp
+*.tmp

@@ -71,7 +71,7 @@ async def get_channel_feed_ytdlp(channel_id: str) -> feedparser.FeedParserDict |
         # in process_subscription (old videos get downloaded because we can't
         # tell they're old). With approximate_date, yt-dlp fills in a best-guess
         # YYYYMMDD for most (not all — Shorts tabs still return NONE).
-        "--extractor-args", "youtubetab:approximate_date",
+        "--extractor-args", "youtubetab:approximate_date,youtube:player_client=android,tv_embedded",
         channel_url,
     ]
     try:
@@ -401,19 +401,19 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
 
         # Subtitles are downloaded separately so a 429 on the subtitle endpoint
         # doesn't block the video download (see download_subtitles docstring).
-        sub_path = await download_subtitles(yt_url, yt_id) if yt_id else None
+        subtitles = await download_subtitles(yt_url, yt_id) if yt_id else []
 
         result = await upload_video(
             file_path, title, playlist_id or None,
             published_at=published_iso,
             thumbnail_url=yt_thumb,
             youtube_id=yt_id,
-            subtitle_path=sub_path or "",
+            subtitles=subtitles,
             duration=duration,
         )
         cleanup_file(file_path)
-        if sub_path:
-            cleanup_file(sub_path)
+        for sub in subtitles:
+            cleanup_file(sub["path"])
 
         if result:
             vh_id = result.get("id", "")

@@ -27,6 +27,12 @@ TMP_DIR: str = os.environ.get("TMP_DIR", "/tmp/yt2tg")
 MAX_FILE_SIZE: str = os.environ.get("MAX_FILE_SIZE", "2G")
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 
+# Timeouts (seconds)
+DOWNLOAD_TIMEOUT: int = int(os.environ.get("DOWNLOAD_TIMEOUT", "3600"))  # 1 hour
+UPLOAD_TIMEOUT: int = int(os.environ.get("UPLOAD_TIMEOUT", "1800"))      # 30 minutes
+REQUEST_TIMEOUT: int = int(os.environ.get("REQUEST_TIMEOUT", "30"))        # 30 seconds
+RSS_TIMEOUT: int = int(os.environ.get("RSS_TIMEOUT", "15"))               # 15 seconds
+
 # Path to a Netscape-format cookies.txt exported from a logged-in YouTube
 # account (see README section "Cookies / возрастные ограничения").
 # Needed for age-restricted videos: YouTube replies
