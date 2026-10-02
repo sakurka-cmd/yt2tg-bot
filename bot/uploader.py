@@ -226,7 +226,7 @@ async def upload_video(file_path: str, title: str,
     })
     logger.info("Uploading to VideoHost: %s (%.1f MB) playlist=%s published_at=%s yt_id=%s thumb=%s subs=%s duration=%s",
                 title, size_mb, playlist_id, published_at or "-", youtube_id or "-",
-                "yes" if thumb_fs_path else "no", "yes" if sub_fs_path else "no",
+                "yes" if thumb_fs_path else "no", "yes" if sub_fs_paths else "no",
                 f"{duration:.1f}s" if duration else "none")
 
     try:

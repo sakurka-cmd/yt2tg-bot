@@ -71,8 +71,12 @@ class DownloadStatus:
             "error": "",
         }
 
-    async def update(self, **kwargs):
-        async with self._lock:
+    def update(self, data=None, **kwargs):
+        # Synchronous on purpose: callers invoke it without await and pass a
+        # positional dict (legacy API). dict.update is atomic in CPython.
+        if data:
+            self._status.update(data)
+        if kwargs:
             self._status.update(kwargs)
 
     async def get(self) -> dict:

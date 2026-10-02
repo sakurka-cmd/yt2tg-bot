@@ -44,10 +44,12 @@ YTDLP_COOKIES: str = os.environ.get("YTDLP_COOKIES", "")
 DEFAULT_QUALITY = "720"
 
 QUALITIES = {
-    "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "4k": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+    # Prefer H.264/AAC (mp4/m4a) so `--merge-output-format mp4` can mux without
+    # ffmpeg "Conversion failed!" (AV1/Opus in mp4 fail to mux). Fall back to any.
+    "480": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
+    "720": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
+    "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+    "4k": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]",
 }
 
 QUALITY_LABELS = {"480": "480p", "720": "720p", "1080": "1080p", "4k": "4K"}
