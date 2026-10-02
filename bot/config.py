@@ -44,14 +44,10 @@ YTDLP_COOKIES: str = os.environ.get("YTDLP_COOKIES", "")
 DEFAULT_QUALITY = "720"
 
 QUALITIES = {
-    # Force H.264 (avc1) + AAC so the merged mp4 plays everywhere, incl. Safari/iOS.
-    # NOTE: [ext=mp4] is NOT enough — YouTube serves AV1 (av01) in mp4 too, and
-    # Safari can't decode AV1 (audio-only playback). Prefer avc1/mp4a, then
-    # progressive H.264, then any codec as a last resort.
-    "480": "bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=480][vcodec^=avc1]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "720": "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][vcodec^=avc1]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "1080": "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=1080][vcodec^=avc1]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "4k": "bestvideo[height<=2160][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=2160][vcodec^=avc1]/bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+    "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
+    "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+    "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+    "4k": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
 }
 
 QUALITY_LABELS = {"480": "480p", "720": "720p", "1080": "1080p", "4k": "4K"}
