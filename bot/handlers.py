@@ -1363,10 +1363,12 @@ def register_handlers(bot: AsyncTeleBot):
             # If it was deleted from VideoHost, drop the cached record so we can re-upload.
             existing = await db.get_processed_video(yt_id)
             if existing:
-                # If user explicitly deleted the video on VideoHost, never re-upload
+                # An explicit /dl request must not be blocked by an earlier deletion:
+                # notify the user and re-download/re-upload anyway.
                 if existing.get("user_deleted", 0):
-                    await bot.send_message(user_id, f"Видео было удалено ранее: {title}")
-                    return
+                    await bot.send_message(user_id, f"⚠️ Видео было удалено ранее — скачиваю заново: {title}")
+                    await db.unmark_video_processed(yt_id)
+                    existing = {}
                 vh_id_old = existing.get("videohost_id", "") or ""
                 if not vh_id_old:
                     # Processed but never actually uploaded (empty videohost_id).
@@ -1376,16 +1378,13 @@ def register_handlers(bot: AsyncTeleBot):
                     await db.unmark_video_processed(yt_id)
                     existing = None
                 elif not await video_exists(vh_id_old):
-                    # Video was deleted on VideoHost (by user OR cleanup) — mark as
-                    # user-deleted, never re-upload. The previous version set
-                    # `existing = None` here, which caused the `if existing: return`
-                    # check below to be skipped → the video was re-downloaded and
-                    # re-uploaded. With `return` here we abort the /dl flow entirely.
-                    logger.info("Video %s (%s) was deleted on VideoHost — marking as user-deleted (won't re-upload)",
+                    # Deleted on VideoHost (by user or cleanup): an explicit /dl
+                    # request must still re-download/re-upload, with a notice.
+                    logger.info("Video %s (%s) was deleted on VideoHost — re-uploading on explicit /dl request",
                                 yt_id, vh_id_old)
-                    await db.mark_video_user_deleted(yt_id)
-                    await bot.send_message(user_id, f"⚠️ Видео ранее было удалено с хостинга: {title}")
-                    return
+                    await db.unmark_video_processed(yt_id)
+                    await bot.send_message(user_id, f"⚠️ Видео ранее было удалено с хостинга — скачиваю заново: {title}")
+                    existing = None
             if existing:
                 current_status.update({"task": "", "progress": "", "error": ""})
                 await bot.send_message(user_id, f"Видео уже загружено ранее: {title}")
@@ -1632,9 +1631,10 @@ def register_handlers(bot: AsyncTeleBot):
             for v in in_period:
                 existing = await db.get_processed_video(v["id"])
                 if existing:
-                    # If user explicitly deleted the video on VideoHost, never re-upload
+                    # Previously-deleted videos are still re-downloaded on an explicit request.
                     if existing.get("user_deleted", 0):
-                        already_done += 1
+                        await db.unmark_video_processed(v["id"])
+                        to_download.append(v)
                         continue
                     vh_id_old = existing.get("videohost_id", "") or ""
                     if not vh_id_old:
@@ -1642,13 +1642,11 @@ def register_handlers(bot: AsyncTeleBot):
                         await db.unmark_video_processed(v["id"])
                         to_download.append(v)
                     elif not await video_exists(vh_id_old):
-                        # Video was deleted on VideoHost — mark as user-deleted, never re-upload.
-                        # The previous version called unmark_video_processed here, which reset
-                        # user_deleted=0 AND cleared videohost_id, causing re-download. Bug fix.
-                        logger.info("Video %s was deleted on VideoHost — marking as user-deleted (won't re-upload)",
+                        # Deleted on VideoHost: re-download on an explicit request.
+                        logger.info("Video %s was deleted on VideoHost — re-downloading on explicit request",
                                     v["id"])
-                        await db.mark_video_user_deleted(v["id"])
-                        already_done += 1
+                        await db.unmark_video_processed(v["id"])
+                        to_download.append(v)
                     else:
                         already_done += 1
                 else:
