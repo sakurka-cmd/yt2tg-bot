@@ -7,7 +7,7 @@ import re
 import shutil
 from pathlib import Path
 
-from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR, YTDLP_COOKIES
+from bot.config import QUALITIES, DEFAULT_QUALITY, MAX_FILE_SIZE, TMP_DIR, YTDLP_COOKIES, DOWNLOAD_TIMEOUT
 from bot import dl_queue
 
 logger = logging.getLogger(__name__)
@@ -447,11 +447,11 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
             *_YTDLP_NICE, *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 3 * 3600  # hard cap: 3h per download
+        deadline = loop.time() + DOWNLOAD_TIMEOUT  # hard cap per download
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.error("Download %s exceeded 3h cap — killing yt-dlp", yt_id)
+                logger.error("Download %s exceeded timeout (%ss) — killing yt-dlp", yt_id, DOWNLOAD_TIMEOUT)
                 try:
                     proc.kill()
                 except ProcessLookupError:
@@ -460,7 +460,7 @@ async def _download_video_locked(url: str, quality: str, yt_id: str) -> str | No
                     await asyncio.wait_for(proc.wait(), timeout=30)
                 except asyncio.TimeoutError:
                     pass
-                current_status["error"] = "download timeout (3h cap)"
+                current_status["error"] = f"download timeout ({DOWNLOAD_TIMEOUT}s)"
                 current_status["task"] = ""
                 current_status["progress"] = ""
                 return None

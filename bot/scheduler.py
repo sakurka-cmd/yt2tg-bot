@@ -14,8 +14,10 @@ from bot.downloader import (
     YTDLP_BIN,
 )
 from bot.uploader import upload_video, sort_playlist, video_exists
-from bot.config import CHECK_INTERVAL, MAX_FILE_SIZE
+from bot.config import CHECK_INTERVAL, MAX_FILE_SIZE, RSS_TIMEOUT
 from bot.filters import should_download
+from bot.messages import failure_reason
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,7 @@ FEED_RETRY_BACKOFF_SEC = 10
 
 async def _fetch_feed_body(session: aiohttp.ClientSession, url: str) -> tuple[int, str | None]:
     """Fetch URL body via aiohttp. Returns (status_code, body_text or None)."""
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=RSS_TIMEOUT)) as resp:
         body = await resp.text() if resp.status == 200 else None
         return resp.status, body
 
@@ -140,10 +142,15 @@ async def get_channel_feed(channel_id: str) -> feedparser.FeedParserDict | None:
     so RSS will almost always 404 now. The yt-dlp fallback uses the channel
     page's video tab and produces the same shape of feed.entries.
     """
-    if channel_id.startswith("@") or channel_id.startswith("UC"):
+    if channel_id.startswith("UC"):
         feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    elif channel_id.startswith("@"):
+        # YouTube RSS has no handle support (channel_id=@handle is invalid).
+        # yt-dlp is the only reliable source for handles.
+        return await get_channel_feed_ytdlp(channel_id)
     else:
-        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id=@{channel_id}"
+        # Legacy username (no @): the old user= feed parameter still applies.
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?user={channel_id}"
 
     rss_failed = False
     async with aiohttp.ClientSession() as session:
@@ -282,8 +289,10 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
             pub_dt = datetime(*published[:6], tzinfo=timezone.utc)
             age = (datetime.now(tz=timezone.utc) - pub_dt).days
             if age > 7:
+                # Do NOT mark old videos as processed: /backfill must be able
+                # to download the archive later. Marking them with an empty
+                # videohost_id made backfill treat them as "already uploaded".
                 logger.info("Skipping old video: %s (%d days)", title, age)
-                await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                 continue
         else:
             # No upload date available — can't verify age. Skip to avoid
@@ -350,44 +359,45 @@ async def process_subscription(sub: dict) -> tuple[int, list[str], list[dict]]:
             # Each failure includes the original YouTube URL so the admin
             # can click and retry manually, or understand what was skipped.
             if file_path == "TOO_LARGE":
-                reason = f"слишком большое видео (>{MAX_FILE_SIZE})"
+                reason = failure_reason("TOO_LARGE")
                 logger.warning("Video too large, skipping: %s", title)
                 await db.mark_video_processed(yt_id, sub_id, title, quality, "")
             elif file_path == "PERMANENT_FAIL":
-                err_detail = current_status.get("error", "")[:120]
-                reason = f"недоступно ({err_detail})" if err_detail else "live/premiere/private"
+                err_detail = current_status.get_sync("error", "")[:120]
+                reason = failure_reason("PERMANENT_FAIL", err_detail)
                 logger.warning("Permanent failure for %s — marking as user-deleted: %s", yt_id, title)
                 await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                 await db.mark_video_user_deleted(yt_id)
             elif file_path == "DUPLICATE":
-                reason = "уже скачивается другим запросом (очередь)"
+                reason = failure_reason("DUPLICATE")
                 logger.info("Video %s already queued by another download — will verify next cycle", yt_id)
             elif file_path == "CANCELLED":
-                reason = "убрано из очереди (/cancel)"
+                reason = failure_reason("CANCELLED")
                 logger.info("Video %s cancelled from queue — will retry next cycle", yt_id)
             elif file_path == "NO_SPACE":
-                reason = "нет места на диске сервера"
+                reason = failure_reason("NO_SPACE")
                 logger.error("Disk full — skipping %s (%s) this cycle, will retry next cycle", yt_id, title)
             elif file_path == "AUTH_REQUIRED":
-                reason = "YouTube анти-бот защита (требуется вход / cookies)"
+                reason = failure_reason("AUTH_REQUIRED")
                 logger.warning("YouTube anti-bot challenge for %s — will retry next cycle", yt_id)
             elif file_path == "AGE_RESTRICTED":
                 # Age-restricted video: YouTube requires an authenticated
                 # session. Permanent without cookies — mark as processed /
                 # user-deleted so the scheduler stops retrying it every cycle.
-                reason = "возрастное ограничение (нужны cookies, см. README)"
+                reason = failure_reason("AGE_RESTRICTED")
                 logger.warning("Age-restricted video %s — marking as user-deleted (no cookies configured): %s", yt_id, title)
                 await db.mark_video_processed(yt_id, sub_id, title, quality, "")
                 await db.mark_video_user_deleted(yt_id)
             else:
                 # Plain None — transient error (network, 403, 429, etc.)
-                err_detail = current_status.get("error", "")[:120]
-                reason = f"сетевая ошибка ({err_detail})" if err_detail else "неизвестная ошибка"
+                err_detail = current_status.get_sync("error", "")[:120]
+                reason = failure_reason("NETWORK", err_detail)
                 logger.warning("Transient failure for %s (%s): %s", yt_id, title, reason)
             failed_downloads.append({
                 "title": title,
                 "reason": reason,
                 "url": yt_url,
+                "yt_id": yt_id,
                 "channel": channel_id,
             })
             continue
@@ -478,7 +488,24 @@ async def scheduler_loop(bot=None, admin_chat_id: int = 0):
                     # Telegram message limit is 4096 chars
                     if len(msg) > 4000:
                         msg = msg[:3990] + "\n..."
-                    await bot.send_message(admin_chat_id, msg)
+                    # Actionable buttons for the first few failures: retry,
+                    # pick another quality, or open on YouTube.
+                    reply_markup = None
+                    if all_failures:
+                        kb = InlineKeyboardMarkup()
+                        for f in all_failures[:3]:
+                            yt = f.get("yt_id", "")
+                            if not yt:
+                                continue
+                            short = f["title"][:28] + ("…" if len(f["title"]) > 28 else "")
+                            kb.row(
+                                InlineKeyboardButton(f"🔁 {short}", callback_data=f"retry:{yt}"),
+                                InlineKeyboardButton("🎚 Качество", callback_data=f"retryq:{yt}"),
+                                InlineKeyboardButton("▶️ YouTube", url=f"https://youtu.be/{yt}"),
+                            )
+                        if kb.keyboard:
+                            reply_markup = kb
+                    await bot.send_message(admin_chat_id, msg, reply_markup=reply_markup)
                 except Exception:
                     pass
 

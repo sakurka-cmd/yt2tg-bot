@@ -1,12 +1,13 @@
 """VideoHost API uploader."""
 
+import asyncio
 import logging
 import os
 from urllib.parse import quote
 
 import aiohttp
 
-from bot.config import VIDEOHOST_URL, VIDEOHOST_TOKEN
+from bot.config import VIDEOHOST_URL, VIDEOHOST_TOKEN, UPLOAD_TIMEOUT, REQUEST_TIMEOUT
 from bot.downloader import current_status
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ async def download_thumbnail(url: str, tmp_dir: str = "/tmp/yt2tg") -> str | Non
     os.makedirs(tmp_dir, exist_ok=True)
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                 if resp.status != 200:
                     logger.warning("Thumbnail download failed %d: %s", resp.status, url)
                     return None
@@ -111,7 +112,7 @@ async def upload_thumbnail(thumb_path: str) -> str | None:
                     f"{VIDEOHOST_URL}/api/bot/upload-thumbnail",
                     data=f,  # raw binary stream
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT * 2),
                 ) as resp:
                     if resp.status == 201:
                         data = await resp.json(content_type=None)
@@ -149,7 +150,7 @@ async def upload_subtitle(subtitle_path: str, language: str = "ru") -> str | Non
                     f"{VIDEOHOST_URL}/api/bot/upload-subtitle",
                     data=f,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT * 2),
                 ) as resp:
                     if resp.status == 201:
                         data = await resp.json(content_type=None)
@@ -205,6 +206,11 @@ async def upload_video(file_path: str, title: str,
     thumb_fs_path = None
     if thumb_path:
         thumb_fs_path = await upload_thumbnail(thumb_path)
+        # Thumbnail was downloaded only for this upload — don't leave temp files.
+        try:
+            os.unlink(thumb_path)
+        except OSError:
+            pass
 
     # Upload subtitles separately (binary POST). yt-dlp downloads auto-generated
     # captions from YouTube; ExoPlayer can render VTT natively.
@@ -270,7 +276,7 @@ async def upload_video(file_path: str, title: str,
                     f"{VIDEOHOST_URL}/api/bot/upload",
                     data=f,  # raw file stream — aiohttp streams this without buffering
                     headers=upload_headers,
-                    timeout=aiohttp.ClientTimeout(total=1800),
+                    timeout=aiohttp.ClientTimeout(total=UPLOAD_TIMEOUT),
                 ) as resp:
                     if resp.status == 201:
                         data = await resp.json(content_type=None)
@@ -308,7 +314,7 @@ async def video_exists(videohost_id: str, retries: int = 3) -> bool:
                 async with session.get(
                     f"{VIDEOHOST_URL}/api/bot/videos/{videohost_id}",
                     headers=_headers(),
-                    timeout=aiohttp.ClientTimeout(total=15),
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
                 ) as resp:
                     if resp.status == 200:
                         return True
@@ -350,7 +356,7 @@ async def sort_playlist(playlist_id: str) -> bool:
             async with session.post(
                 f"{VIDEOHOST_URL}/api/bot/playlists/{playlist_id}/sort",
                 headers=_headers(),
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT * 2),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
@@ -398,7 +404,7 @@ async def find_or_create_playlist(name: str, description: str = "") -> dict | No
                 f"{VIDEOHOST_URL}/api/bot/playlists",
                 json=payload,
                 headers=_headers(),
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as resp:
                 if resp.status in (200, 201):
                     data = await resp.json(content_type=None)

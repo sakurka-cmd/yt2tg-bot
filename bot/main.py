@@ -105,6 +105,8 @@ async def main():
     await db.init_db()
     await cleanup_stale_files()
     logger.info("Bot started (admins: %s)", ADMIN_IDS)
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS is empty — admin commands are disabled for everyone")
 
     # Register commands with Telegram (shows in / command autocomplete).
     # Non-critical: runs in the background with retries, never blocks startup.

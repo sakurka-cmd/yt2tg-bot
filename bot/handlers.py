@@ -4,11 +4,12 @@ import asyncio
 import logging
 
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import Message, CallbackQuery
+from telebot.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from bot import database as db
 from bot import dl_queue
 from bot.states import States
+from bot.messages import user_error_message
 from bot.downloader import (
     download_video, extract_video_id, extract_all_video_ids, extract_channel_id,
     get_video_info, get_channel_info, cleanup_file, current_status,
@@ -36,9 +37,8 @@ backfill_tasks: dict[int, dict] = {}
 
 
 def is_admin(user_id: int) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return user_id in ADMIN_IDS
+    # Fail closed: an empty ADMIN_IDS must not grant admin rights to everyone.
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
 
 def register_handlers(bot: AsyncTeleBot):
@@ -1315,6 +1315,25 @@ def register_handlers(bot: AsyncTeleBot):
                 data["query"] = query
                 data["results"] = results
                 await db.save_fsm_state(uid, States.SEARCH_RESULTS, data)
+                # Thumbnails for the first few results, each with its own
+                # download button. The full text list below remains for the
+                # rest (Telegram photos carry one caption each).
+                for i, r in enumerate(results[:5]):
+                    thumb = r.get("thumbnail")
+                    if not thumb:
+                        continue
+                    try:
+                        kb = InlineKeyboardMarkup()
+                        kb.add(InlineKeyboardButton("⬇️ Скачать", callback_data=f"sr:{i}"))
+                        caption = f"{i + 1}. {r.get('title', '')}"
+                        if len(caption) > 900:
+                            caption = caption[:900] + "..."
+                        await bot.send_photo(
+                            status_msg.chat.id, thumb,
+                            caption=caption, reply_markup=kb,
+                        )
+                    except Exception as e:
+                        logger.warning("send_photo failed for %s: %s", thumb, e)
                 # Format message with thumbnails
                 lines = [f"🔍 Запрос: «{query}»", f"Найдено: {len(results)} видео", ""]
                 for i, r in enumerate(results, 1):
@@ -1455,68 +1474,13 @@ def register_handlers(bot: AsyncTeleBot):
                 url, quality,
                 meta={"title": title, "user_id": user_id, "source": "oneoff"},
             )
-            if not file_path or file_path == "TOO_LARGE" or file_path == "PERMANENT_FAIL" or file_path == "NO_SPACE" or file_path == "AUTH_REQUIRED" or file_path == "DUPLICATE" or file_path == "CANCELLED" or file_path == "AGE_RESTRICTED":
-                if file_path == "TOO_LARGE":
-                    await bot.send_message(user_id, f"⚠️ Файл слишком большой: {title}")
-                elif file_path == "DUPLICATE":
-                    # Lost the race — another task queued the same video between
-                    # our pre-check and download_video's own registration.
-                    await bot.send_message(user_id, f"⏳ Это видео уже скачивается или стоит в очереди: {title}")
-                elif file_path == "CANCELLED":
-                    await bot.send_message(user_id, f"⏹ Загрузка была убрана из очереди (/cancel): {title}")
-                elif file_path == "PERMANENT_FAIL":
-                    # yt-dlp detected a permanent failure (live event not started,
-                    # premiere scheduled, private/deleted, members-only). Tell
-                    # the user and mark as user-deleted so subscriptions don't
-                    # keep retrying this same URL every cycle.
-                    err_detail = current_status.get("error", "")[:200]
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ Видео недоступно для скачивания: {title}\n"
-                        f"Причина: {err_detail or 'live event / premiere / private'}\n\n"
-                        f"Это премьера, идёт прямой эфир, или видео скрыто.\n"
-                        f"Если это премьера — попробуйте снова после её начала."
-                    )
+            if not file_path or file_path in ("TOO_LARGE", "PERMANENT_FAIL", "NO_SPACE", "AUTH_REQUIRED", "DUPLICATE", "CANCELLED", "AGE_RESTRICTED"):
+                detail = current_status.get_sync("error", "")[:200]
+                code = file_path or "NETWORK"
+                # Unified message for every download failure path.
+                await bot.send_message(user_id, user_error_message(code, title, detail))
+                if code in ("PERMANENT_FAIL", "AGE_RESTRICTED"):
                     await db.mark_video_user_deleted(yt_id)
-                elif file_path == "NO_SPACE":
-                    # Disk full on the bot's VPS. NOT a video problem —
-                    # the user can retry after the operator cleans up /tmp.
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ Нет места на диске сервера: {title}\n\n"
-                        f"Бот не может скачать видео — заполнен /tmp.\n"
-                        f"Попробуйте позже, после очистки диска."
-                    )
-                elif file_path == "AUTH_REQUIRED":
-                    # YouTube anti-bot challenge — not permanent, will work
-                    # later when YouTube relaxes the protection.
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ YouTube заблокировал скачивание: {title}\n\n"
-                        f"Срабатывает анти-бот защита (\"Sign in to confirm you're not a bot\").\n"
-                        f"Это временно — попробуйте позже."
-                    )
-                elif file_path == "AGE_RESTRICTED":
-                    # Age-restricted video: YouTube requires an authenticated
-                    # session (cookies). Without YTDLP_COOKIES configured this
-                    # is permanent — tell the user instead of endlessly
-                    # retrying, and mark the video so subscriptions don't loop.
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ Видео с возрастным ограничением: {title}\n\n"
-                        f"YouTube требует авторизацию (\"Sign in to confirm your age\").\n"
-                        f"Такие видео скачиваются только с cookies — см. README (\"Cookies\")."
-                    )
-                    await db.mark_video_user_deleted(yt_id)
-                else:
-                    err_detail = current_status.get("error", "")[:200]
-                    await bot.send_message(
-                        user_id,
-                        f"⚠️ Ошибка скачивания: {title}\n"
-                        f"Причина: {err_detail or 'неизвестна'}\n\n"
-                        f"Возможно, видео недоступно или YouTube требует обновления yt-dlp.\n"
-                        f"Попробуйте позже или другое качество."
-                    )
                 return
 
             subtitles = await download_subtitles(url, yt_id) if yt_id else []
@@ -1560,6 +1524,64 @@ def register_handlers(bot: AsyncTeleBot):
             current_status.update({
                 "task": "", "progress": "", "error": "", "url": "", "title": ""
             })
+    # ── Admin retry callbacks from scheduler failure reports ──
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("retryq:"))
+    async def cb_retry_quality_menu(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            await bot.answer_callback_query(call.id, "Только для администратора")
+            return
+        yt_id = call.data.split(":", 1)[1]
+        await bot.answer_callback_query(call.id)
+        ikm = InlineKeyboardMarkup()
+        for q, label in QUALITY_LABELS.items():
+            ikm.add(InlineKeyboardButton(label, callback_data=f"rq:{q}:{yt_id}"))
+        ikm.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
+        await bot.send_message(
+            call.message.chat.id,
+            f"Выберите качество для повтора {yt_id}:",
+            reply_markup=ikm,
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("rq:"))
+    async def cb_retry_quality(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            await bot.answer_callback_query(call.id, "Только для администратора")
+            return
+        parts = call.data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in QUALITY_LABELS:
+            await bot.answer_callback_query(call.id, "Некорректная команда")
+            return
+        _, quality, yt_id = parts
+        await bot.answer_callback_query(call.id, "Повторяю...")
+        await bot.send_message(
+            call.message.chat.id,
+            f"🔁 Повторяю {yt_id} в {QUALITY_LABELS[quality]}...",
+        )
+        asyncio.create_task(_process_oneoff(call.message.chat.id, {
+            "url": f"https://www.youtube.com/watch?v={yt_id}",
+            "youtube_id": yt_id,
+            "title": yt_id,
+            "quality": quality,
+        }))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("retry:"))
+    async def cb_retry(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            await bot.answer_callback_query(call.id, "Только для администратора")
+            return
+        yt_id = call.data.split(":", 1)[1]
+        await bot.answer_callback_query(call.id, "Повторяю...")
+        await bot.send_message(
+            call.message.chat.id,
+            f"🔁 Повторяю {yt_id} в {QUALITY_LABELS[DEFAULT_QUALITY]}...",
+        )
+        asyncio.create_task(_process_oneoff(call.message.chat.id, {
+            "url": f"https://www.youtube.com/watch?v={yt_id}",
+            "youtube_id": yt_id,
+            "title": yt_id,
+            "quality": DEFAULT_QUALITY,
+        }))
+
     # ── Background task: download YouTube playlist ────────────
     async def _process_dl_playlist(user_id: int, data: dict, period: str):
         """Download all videos from a YouTube playlist into a VideoHost playlist
@@ -1838,7 +1860,11 @@ def register_handlers(bot: AsyncTeleBot):
                 existing = await db.get_processed_video(v["id"])
                 if existing:
                     vh_id_old = existing.get("videohost_id", "") or ""
-                    if vh_id_old and not await video_exists(vh_id_old):
+                    # Empty videohost_id means the video was never actually
+                    # uploaded (old scheduler bug / permanent skip). Backfill is
+                    # an explicit user action, so retry it instead of counting
+                    # it as already done.
+                    if not vh_id_old or not await video_exists(vh_id_old):
                         await db.unmark_video_processed(v["id"])
                         to_download.append(v)
                     else:

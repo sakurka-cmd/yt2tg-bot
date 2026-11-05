@@ -118,8 +118,8 @@ Filter skip: <title> (<yt_id>) — white='...' black='...'
 ### Зависимости
 
 - Python 3.12+
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`pip install yt-dlp`)
-- [ffmpeg](https://ffmpeg.org/) (для слияния видео/аудио)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) и `curl_cffi` — ставятся из `requirements.txt`
+- [ffmpeg](https://ffmpeg.org/) + `ffprobe` — системный пакет (`apt install ffmpeg`)
 
 ### Установка
 
@@ -151,11 +151,15 @@ nano .env
 | `TG_BOT_TOKEN` | Да | Токен Telegram-бота от @BotFather |
 | `VIDEOHOST_URL` | Нет | URL VideoHost (по умолчанию `http://127.0.0.1:3002`) |
 | `VIDEOHOST_TOKEN` | Да | Токен бота из админки VideoHost |
-| `ADMIN_IDS` | Нет | Список Telegram ID администраторов через запятую (доступ для всех если пусто) |
+| `ADMIN_IDS` | Нет | Список Telegram ID администраторов через запятую. Если пусто — админ-команды недоступны никому (fail-closed) |
 | `CHECK_INTERVAL` | Нет | Интервал проверки подписок в секундах (по умолчанию 3600 = 1 час) |
 | `DATABASE_URL` | Нет | Путь к SQLite (по умолчанию `data/yt2tg_bot.db`) |
 | `TMP_DIR` | Нет | Временная директория для загрузок (по умолчанию `/tmp/yt2tg`) |
-| `MAX_FILE_SIZE` | Нет | Макс. размер файла в байтах (0 = без лимита) |
+| `MAX_FILE_SIZE` | Нет | Макс. размер файла: `2G`, `500M`, `100K` или байты; `0` = без лимита (по умолчанию `2G`) |
+| `DOWNLOAD_TIMEOUT` | Нет | Таймаут одной загрузки, сек (по умолчанию 3600) |
+| `UPLOAD_TIMEOUT` | Нет | Таймаут загрузки в VideoHost, сек (по умолчанию 1800) |
+| `REQUEST_TIMEOUT` | Нет | Таймаут обычных HTTP-запросов, сек (по умолчанию 30) |
+| `RSS_TIMEOUT` | Нет | Таймаут запроса RSS, сек (по умолчанию 15) |
 | `LOG_LEVEL` | Нет | Уровень логирования (по умолчанию `INFO`) |
 | `YTDLP_COOKIES` | Нет | Путь к cookies.txt (Netscape) от залогиненного YouTube-аккаунта — для возрастных видео (по умолчанию пусто) |
 
