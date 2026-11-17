@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from pathlib import Path
 
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -31,6 +32,9 @@ from bot.version_checker import get_versions_report
 
 logger = logging.getLogger(__name__)
 
+BOT_ASSETS = Path(__file__).resolve().parent / "assets"
+START_IMAGE = BOT_ASSETS / "utube-bot.png"
+
 # Registry of active backfill/playlist-download tasks, keyed by user_id.
 # Setting cancel=True causes the running task to stop after the current video.
 backfill_tasks: dict[int, dict] = {}
@@ -46,12 +50,19 @@ def register_handlers(bot: AsyncTeleBot):
     # ── /start ──────────────────────────────────────────────
     @bot.message_handler(commands=["start"])
     async def cmd_start(msg: Message):
-        await bot.reply_to(
-            msg,
+        caption = (
             "🎬 UTube Bot — сохранение видео с YouTube в VideoHost\n\n"
-            "Выберите действие в меню ниже 👇",
-            reply_markup=main_menu_keyboard(),
+            "Выберите действие в меню ниже 👇"
         )
+        markup = main_menu_keyboard()
+        try:
+            await bot.send_photo(
+                msg.chat.id, str(START_IMAGE),
+                caption=caption, reply_markup=markup,
+            )
+        except Exception as e:
+            logger.warning("start image failed: %s", e)
+            await bot.reply_to(msg, caption, reply_markup=markup)
 
     # ── Text button aliases (from ReplyKeyboard) ─────────────
     BUTTON_ALIASES = {

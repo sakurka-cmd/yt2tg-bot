@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="bot/assets/utube-bot.png" alt="UTube Bot" width="560">
+</p>
+
 # yt2tg-bot
 
 YouTube → VideoHost Telegram Bot
@@ -287,6 +291,13 @@ Cookies передаются во ВСЕ вызовы yt-dlp (инфо, скач
 | Дедупликация | SQLite | SQLite |
 | FSM | vkbottle | pyTelegramBotAPI |
 | Планировщик | Встроенный | Встроенный |
+
+## Логотип
+
+- Приветственная картинка: [`bot/assets/utube-bot.png`](bot/assets/utube-bot.png) — отправляется в `/start`.
+- Аватар: [`bot/assets/utube-avatar.png`](bot/assets/utube-avatar.png) (512×512). Загрузить в BotFather командой `/setuserpic`.
+- Фирменные цвета: UTube Red `#E03131`, тёмный `#0F0F10`, белый `#FFFFFF`.
+- Полный набор логотипа и иконок: `/root/projects/Utube/brand/` (`logo/`, `exports/`, гайд в `README.md`).
 
 ## Лицензия
 
