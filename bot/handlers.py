@@ -45,6 +45,19 @@ def is_admin(user_id: int) -> bool:
     return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
 
+async def _edit_or_send(bot: AsyncTeleBot, call: CallbackQuery, text: str, reply_markup=None):
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        logger.info("edit_message_text failed (%s); sending new message", e)
+        await bot.send_message(call.message.chat.id, text, reply_markup=reply_markup)
+
+
 def register_handlers(bot: AsyncTeleBot):
 
     # ── /start ──────────────────────────────────────────────
@@ -991,15 +1004,14 @@ def register_handlers(bot: AsyncTeleBot):
             # ═══════════════════════════════════════════════════════
             #  Search results: tap on a video to start /dl flow for it
             # ═══════════════════════════════════════════════════════
-            if data_str.startswith("sr:") and state == States.SEARCH_RESULTS:
+            if data_str.startswith("sr:"):
                 action = data_str.split(":", 1)[1]
                 if action == "new":
-                    # User wants a new search
                     await db.save_fsm_state(uid, States.SEARCH_ASK_QUERY, {})
-                    await bot.edit_message_text(
+                    await _edit_or_send(
+                        bot,
+                        call,
                         "🔍 Отправьте новый поисковый запрос:",
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
                         reply_markup=cancel_keyboard(),
                     )
                     await bot.answer_callback_query(call.id)
@@ -1012,26 +1024,25 @@ def register_handlers(bot: AsyncTeleBot):
                     return
                 results = data.get("results") or []
                 if idx < 0 or idx >= len(results):
-                    await bot.answer_callback_query(call.id, "Результат не найден")
+                    await bot.answer_callback_query(
+                        call.id, "Результаты устарели. Выполните новый поиск: /search"
+                    )
                     return
                 r = results[idx]
                 url = r["url"]
                 title = r["title"]
                 yt_id = r["id"]
-                # Transition to DL_ASK_QUALITY (skip DL_ASK_URL — we already have the URL)
                 data["url"] = url
                 data["youtube_id"] = yt_id
                 data["title"] = title
-                # Clear results from state to avoid storing large list
-                data.pop("results", None)
                 await db.save_fsm_state(uid, States.DL_ASK_QUALITY, data)
-                await bot.edit_message_text(
+                await _edit_or_send(
+                    bot,
+                    call,
                     f"🎬 Выбрано: {title}\n"
                     f"   Канал: {r.get('channel', '?')}\n"
                     f"   Ссылка: {url}\n\n"
                     f"Выберите качество:",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
                     reply_markup=quality_keyboard(),
                 )
                 await bot.answer_callback_query(call.id)
